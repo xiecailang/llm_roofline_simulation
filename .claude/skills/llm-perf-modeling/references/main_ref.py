@@ -1,0 +1,1 @@
+# 根据配置调用inference/models下的代码评估性能，需要传入hardware_config, model_config, deploy_config, quant_config

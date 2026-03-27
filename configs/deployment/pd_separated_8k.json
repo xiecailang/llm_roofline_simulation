@@ -1,0 +1,18 @@
+{
+  "deployment_mode": "pd_separated",
+  "mtp_length": 4,
+  "mtp_acceptance_rate": 0.85,
+  "context_parallel": 1,
+  "attention_tp": 8,
+  "pipeline_parallel": 1,
+  "pipeline_bubble_rate": 0.08,
+  "expert_parallel": 8,
+  "moe_tp": 1,
+  "lm_head_tp": 8,
+  "micro_batch_size": 1,
+  "ep_load_imbalance_factor": 1.15,
+  "enable_compute_comm_overlap": true,
+  "overlap_efficiency": 0.85,
+  "input_length": 8192,
+  "output_length": 1
+}

@@ -1,0 +1,8 @@
+{
+  "default_weight_bits": 8,
+  "default_activation_compute_bits": 8,
+  "default_activation_transfer_bits": 8,
+  "default_cache_read_bits": 8,
+  "default_cache_write_bits": 8,
+  "op_overrides": {}
+}
