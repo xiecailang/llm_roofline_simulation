@@ -517,9 +517,135 @@ class Indexer(nn.Module):
 ### MLA (Multi-head Latent Attention) 建模
 
 关键优化：
-- KV cache 存储压缩后的 latent (kv_lora_rank 维度)
+- KV cache 存储压缩后的 latent
 - 而不是完整的 KV (num_heads × head_dim)
 - 访存量大幅减少
+
+### Attention 访存量 (Memory Access) 计算
+
+Flash Attention 的关键优势是避免物化 N×N attention matrix，将 IO 复杂度从 O(Nd + N²) 降低到 O(N²d²/M)（M = SRAM size）。
+
+Decode 阶段是 memory-bound：bytes per token ≈ 2 × N × head_dim (K+V reads dominate)。
+
+#### MLA/DSA KV Cache 结构
+
+MLA KV cache **不是** `kv_lora_rank` 维度，而是 `kv_lora_rank + qk_rope_head_dim`：
+
+```
+KV cache per token per layer = kv_lora_rank + qk_rope_head_dim
+```
+
+组成：
+- `compressed_kv` (kv_lora_rank=512): 压缩后的 latent
+- `k_pe` (qk_rope_head_dim=64): RoPE 位置编码
+
+**DeepSeek-V3 示例**: 512 + 64 = **576 values/token/layer** (~93% KV cache 压缩)
+
+参考: DeepSeek FlashMLA deep-dive: `memory_accessed ≈ 2 × s_k × (kv_lora_rank + qk_rope_head_dim) bytes`
+
+#### MLA 访存量公式
+
+```python
+kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # 576 for DeepSeek-V3
+
+read_q = batch × (num_heads/TP) × seq_len × qk_head_dim × act_bytes
+read_kv = batch × kv_seq_len × kv_cache_dim × cache_read_bytes
+write_out = batch × (num_heads/TP) × seq_len × v_head_dim × act_bytes
+```
+
+#### DSA 访存量公式
+
+与 MLA 相同的 KV cache 结构，但 decode 阶段只读取 topk 个 token：
+
+```python
+kv_cache_dim = kv_lora_rank + qk_rope_head_dim
+
+if is_prefill:
+    effective_kv_len = kv_seq_len
+else:
+    effective_kv_len = min(index_topk, kv_seq_len)  # DSA: 只读 topk
+
+read_kv = batch × effective_kv_len × kv_cache_dim × cache_read_bytes
+```
+
+#### GQA 访存量公式
+
+GQA **没有** MLA 压缩，KV cache 存储完整的 K 和 V：
+
+```python
+# K 和 V 都需要从 HBM 读取（系数 2）
+read_kv = 2 × batch × (num_kv_heads/TP) × kv_seq_len × head_dim × cache_read_bytes
+```
+
+**关键**: 系数 **2** 不能省略！Flash Attention decode 必须读取完整的 K cache 和 V cache。
+
+#### Linear Attention (DeltaNet) 访存量公式
+
+固定大小状态，无 growing KV cache：
+
+```python
+# State S: [num_key_heads/TP, key_head_dim, value_head_dim] per batch
+read_state = batch × (num_key_heads/TP) × key_head_dim × value_head_dim × cache_read_bytes
+```
+
+#### 各 Attention 类型 KV Cache 对比
+
+| 类型 | KV Cache per token/layer | DeepSeek-V3 (FP16) | Qwen 2.5 72B (FP16) |
+|------|-------------------------|-------------------|---------------------|
+| MLA/DSA | kv_lora_rank + qk_rope_head_dim | 576 × 2 = 1,152 B | N/A |
+| GQA | 2 × num_kv_heads × head_dim | N/A | 2 × 8 × 128 × 2 = 4,096 B |
+| Linear | 固定状态 (无 growing) | N/A | N/A |
+
+GQA 的 KV cache 是 MLA 的 **3.6 倍**！
+
+#### ❌ 错误33：MLA/DSA KV cache 访存遗漏 qk_rope_head_dim
+
+```python
+# ❌ 错误：只读取 kv_lora_rank
+read_kv_latent = batch × kv_seq_len × kv_lora_rank × cache_read_bytes
+
+# ✅ 正确：KV cache = compressed_kv + k_pe (位置编码)
+read_kv_latent = batch × kv_seq_len × (kv_lora_rank + qk_rope_head_dim) * cache_read_bytes
+```
+
+**为什么**: MLA 的 KV cache 由两部分组成：`compressed_kv` (latent, kv_lora_rank 维度) 和 `k_pe` (位置编码, qk_rope_head_dim 维度)。
+Flash Attention 内核需要读取两者来计算带位置编码的 Q@K^T。
+
+**数值影响**: DeepSeek-V3 遗漏 `qk_rope_head_dim=64`，低估 KV cache 访存 12.5% (512 vs 576)。
+
+#### ❌ 错误34：GQA KV cache 访存遗漏 K 或 V
+
+```python
+# ❌ 错误：只读取 K 或 V（系数 1）
+read_kv = batch × (num_kv_heads/TP) × kv_seq_len × head_dim × cache_read_bytes
+
+# ✅ 正确：K 和 V 都需要读取（系数 2）
+read_kv = 2 × batch × (num_kv_heads/TP) × kv_seq_len × head_dim × cache_read_bytes
+```
+
+**为什么**: Flash Attention 内核在计算 Q@K^T 时读取 K，在计算 score@V 时读取 V。
+两者都需要从 HBM 加载，不能省略。
+
+**数值影响**: 低估 50% KV cache 访存量。
+
+#### ❌ 错误35：将用户公式中的 `(nope*2+rope)` 误解为权重访存
+
+```python
+# 用户的公式中出现过 (nope_head_dim*2+rope_head_dim)，这实际上是：
+# qk_nope_head_dim + v_head_dim + qk_rope_head_dim
+# = qk_head_dim + v_head_dim
+# 这是 CUBE FLOPs 公式中的维度（Q@K + S@V 的总维度），不是访存公式！
+
+# ❌ 错误：将 (nope*2+rope) 用于访存计算
+mem = batch × seq × (nope*2 + rope) × dtype
+
+# ✅ 正确：访存使用 kv_cache_dim
+mem_kv = batch × kv_seq_len × (kv_lora_rank + qk_rope_head_dim) * cache_read_bytes
+```
+
+**为什么**: `(nope*2+rope)` 只在 DeepSeek-V3 上等于 `qk_head_dim + v_head_dim`，
+因为 v_head_dim = qk_nope_head_dim = 128。这是 CUBE FLOPs 公式中的维度，不是 KV cache 的维度。
+KV cache 存储的是压缩后的 latent，维度是 `kv_lora_rank + qk_rope_head_dim`。
 
 ### 代码生成原则
 
@@ -771,19 +897,36 @@ class Model:
             data_size = batch * seq * hidden * act_bytes
             self.add_module('p2p_send', LayerP2P(..., data_size))
 
-# ❌ 错误15：EP 未影响专家权重访存
-# EP 切分专家，每个 EP rank 只存储 1/EP 的专家权重
+# ❌ 错误15：EP 权重访存计算错误
+# EP 切分专家，每个 EP rank 存储 num_experts_per_ep 个专家的完整权重
+# 关键：EP 切分的是专家，不是权重！
+# 详见 "EP 对权重访存的影响（MoE 权重访存计算）" 小节
 
-# 错误示例：
+# 错误示例1：EP 未影响专家权重访存
 class LayerExpertUp(LayerBase):
     def get_mem_bytes(self):
-        read_weight = hidden * intermediate_per_tp * weight_bytes  # 未除以 EP！
+        read_weight = hidden * intermediate_per_tp * weight_bytes  # 未考虑 EP！
 
-# 正确：EP 减少权重存储
+# 错误示例2：错误地将权重除以 EP
 class LayerExpertUp(LayerBase):
     def get_mem_bytes(self):
-        # 每个 EP rank 只存储 1/EP 的专家权重
-        read_weight = hidden * intermediate_per_tp * weight_bytes / self.ep
+        read_weight = hidden * intermediate_per_tp * weight_bytes / self.ep  # 错误！
+
+# ✅ 正确：每个 EP rank 存储 num_experts_per_ep 个专家的完整权重
+# num_experts_per_ep = ceil(num_experts / ep) + r_per_ep
+class LayerExpertUp(LayerBase):
+    def get_mem_bytes(self):
+        if self.is_shared:
+            # Shared Expert: 完全复制，不使用 EP
+            read_weight = hidden * intermediate_per_tp * weight_bytes * self.num_shared_experts
+        else:
+            # Routed Expert: EP 切分专家
+            read_weight = hidden * intermediate_per_tp * weight_bytes * self.num_experts_per_ep
+
+# 数值对比 (DeepSeek V3: num_experts=256, ep=8, intermediate=2048, hidden=7168):
+# 错误示例1: 7168 × 2048 × 1 = 14.68 MB (未考虑 EP，每个卡存全部专家)
+# 错误示例2: 7168 × 2048 × 1 / 8 = 1.84 MB (错误地除以 EP)
+# 正确: 7168 × 2048 × 1 × 32 = 469 MB (每卡存32个专家的完整权重)
 
 # ❌ 错误16：PP bubble 未在性能计算中体现
 # PP 引入 pipeline bubble，降低有效吞吐
@@ -1404,7 +1547,7 @@ system_tps = single_tp_tps * num_tp_groups  # 不是乘以global_batch_size!
 | 策略 | FLOPs | 权重访存 | 激活访存 | 通信 | 建模方式 |
 |------|-------|----------|----------|------|----------|
 | **TP** | ÷ TP | ÷ TP | ÷ TP | AllReduce/AG/RS | 切分权重矩阵 |
-| **EP** | **不变** | **÷ EP** | 不变 | All-to-All | 切分专家数量 |
+| **EP** | **不变** | **× (num_experts/ep)** | 不变 | All-to-All | 存储部分专家 |
 | **PP** | ÷ PP (少构建层) | ÷ PP (少层权重) | 不变 | P2P | 切分模型层数 |
 | **CP** | ÷ CP | 不变 | ÷ CP | Ring Attn | 切分序列长度 |
 | **moe_tp** | 不变 (切intermediate) | ÷ moe_tp | 不变 | AG/RS | 切分专家intermediate |
@@ -1525,6 +1668,61 @@ def all_to_all_latency(data_size, num_ranks, bandwidth, rtt_overhead):
 | 通信量 | 高 (~9x TP) | 低 |
 | 内存效率 | 高（专家数多时） | 低（每个 TP rank 都要存完整专家） |
 | 适用场景 | 大规模 MoE (专家数 > 设备数) | 小规模 MoE |
+
+#### EP 对权重访存的影响（MoE 权重访存计算）
+
+**核心原则：EP 切分的是专家，不是权重！**
+
+EP 将不同的专家分配到不同设备，每个设备持有部分专家的**完整权重**（不切分单个专家的权重矩阵）。
+
+```
+EP 权重分布:
+  Rank 0: Expert 0 (完整), Expert 1 (完整), ..., Expert 31 (完整)
+  Rank 1: Expert 32 (完整), Expert 33 (完整), ..., Expert 63 (完整)
+  ...
+
+每个 EP rank 存储 num_experts_per_ep 个专家的完整权重，而不是 1/EP 的切分权重。
+```
+
+**公式**:
+```python
+# ❌ 错误：将单个专家权重除以 EP（误当作 TP 式的权重切分）
+read_weight = hidden * intermediate * weight_bytes / ep
+
+# ✅ 正确：每个 EP rank 存储 num_experts_per_ep 个专家的完整权重
+read_weight = hidden * intermediate * weight_bytes * num_experts_per_ep
+```
+
+**num_experts_per_ep 计算**（含冗余专家）:
+```python
+import math
+num_experts_per_ep = math.ceil(num_experts / ep) + r_per_ep
+# r_per_ep: 每个 EP rank 额外存储的冗余专家数，用于负载均衡
+# 典型值: 0-2
+```
+
+**数值示例** (DeepSeek V3, moe_down: intermediate=2048, hidden=7168, weight_bytes=1):
+| 实现 | 公式 | 权重访存量 |
+|------|------|-----------|
+| ❌ 错误 (除以 EP) | 2048 × 7168 × 1 / 8 | **1.84 MB** |
+| ❌ 错误 (未考虑 EP) | 2048 × 7168 × 1 × 256 | **3.75 GB** |
+| ✅ 正确 | 2048 × 7168 × 1 × 32 | **469 MB** |
+
+**正确实现与错误除以 EP 差异 256 倍！**
+
+**Shared Expert vs Routed Expert**:
+
+| 专家类型 | EP 行为 | 权重访存公式 |
+|----------|---------|-------------|
+| **Routed Expert** | EP 切分专家 | `weight × num_experts_per_ep` |
+| **Shared Expert** | 完全复制，不使用 EP | `weight × num_shared_experts` |
+
+Shared Expert 在每个 EP rank 上都有完整副本，不参与 EP 切分。
+
+**检查要点**:
+1. 所有 MoE 算子的 `get_mem_bytes()` 中，`read_weight` 使用 `num_experts_per_ep` 而非 `/ ep`
+2. `LayerBase` 已提供 `num_experts_per_ep` 属性：`math.ceil(n_routed_experts / ep) + r_per_ep`
+3. 区分 Shared Expert (`is_shared=True`) 和 Routed Expert (`is_shared=False`)
 
 ---
 

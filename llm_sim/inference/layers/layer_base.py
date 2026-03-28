@@ -36,6 +36,11 @@ class LayerBase:
         self.cp = deploy_config.context_parallel
         self.moe_tp = deploy_config.moe_tp
 
+        # MoE 专家数配置
+        self.n_routed_experts = getattr(model_config, 'num_experts', 0)
+        self.num_shared_experts = getattr(model_config, 'num_shared_experts', 0)
+        self.r_per_ep = getattr(deploy_config, 'r_per_ep', 0)
+
         # 量化配置
         self.weight_bits = quant_config.default_weight_bits
         self.act_compute_bits = quant_config.default_activation_compute_bits
@@ -54,6 +59,18 @@ class LayerBase:
         self.is_comm_op = False
         # 标记是否已在内部处理overlap（避免ModuleBase重复处理）
         self.has_internal_overlap = False
+
+    @property
+    def num_experts_per_ep(self) -> int:
+        """每 EP rank 存储的 routed expert 数量（含冗余）
+
+        EP 切分的是专家，不是权重。每个 EP rank 存储 ceil(num_experts/ep) 个专家的完整权重。
+        r_per_ep 用于负载均衡，每个 rank 额外存储的冗余专家数。
+        """
+        import math
+        if self.ep == 0:
+            return 0
+        return math.ceil(self.n_routed_experts / self.ep) + self.r_per_ep
 
     def get_cube_flops(self):
         """计算CUBE计算量 (FLOPs) - 子类实现"""

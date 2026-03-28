@@ -84,8 +84,16 @@ class LayerDSAAttention(LayerBase):
         """DSA + MLA 的内存访问
 
         DSA 优化：Decode 阶段只读取 topk 个 token 的 KV cache latent
-        MLA 优化：KV cache 存储压缩后的 latent (kv_lora_rank 维度)
+        MLA 优化：KV cache 存储压缩后的 latent
+        - compressed_kv: kv_lora_rank 维度（latent）
+        - k_pe: qk_rope_head_dim 维度（位置编码）
+        - 总计: kv_lora_rank + qk_rope_head_dim per token per layer
+
+        参考: DeepSeek FlashMLA deep-dive
+        Decode: memory_accessed ≈ 2 * s_k * (kv_lora_rank + qk_rope_head_dim) bytes
         """
+        kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim  # MLA KV cache per token
+
         if self.is_prefill:
             effective_kv_len = self.kv_seq_len
         else:
@@ -95,10 +103,8 @@ class LayerDSAAttention(LayerBase):
         # Q: [B, H/TP, S, qk_head_dim]
         read_q = self.batch_size * self.num_heads_per_tp * self.seq_len * self.qk_head_dim * self.act_transfer_bytes
 
-        # KV cache 读取：压缩后的 latent [B, effective_KV_S, kv_lora_rank]
-        # MLA: cache 大小与 num_heads 无关，存储的是 latent
-        # DSA: 只读取 topk 个 token 的 latent
-        read_kv_latent = self.batch_size * effective_kv_len * self.kv_lora_rank * self.cache_read_bytes
+        # KV cache 读取：latent + position encoding [B, effective_KV_S, kv_lora_rank + qk_rope_head_dim]
+        read_kv_latent = self.batch_size * effective_kv_len * kv_cache_dim * self.cache_read_bytes
 
         # Output: [B, H/TP, S, v_head_dim]
         write_out = self.batch_size * self.num_heads_per_tp * self.seq_len * self.v_head_dim * self.act_transfer_bytes

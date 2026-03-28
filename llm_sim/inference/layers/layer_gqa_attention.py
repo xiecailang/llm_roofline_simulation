@@ -81,12 +81,18 @@ class LayerGQAAttention(LayerBase):
         GQA KV cache: 每个 token 存储 num_kv_heads × head_dim (无压缩)
         MLA KV cache: 每个 token 存储 kv_lora_rank (压缩后)
 
+        Flash Attention decode 是 memory-bound:
+        - 需要读取完整的 K cache 和 V cache
+        - bytes per token ≈ 2 × N × head_dim (K+V reads dominate)
+
         TP 影响: 每个 TP 节点读取 num_kv_heads/TP 个 KV head
         """
         # Q: [B, H/TP, S, head_dim]
         read_q = self.batch_size * self.num_heads_per_tp * self.seq_len * self.head_dim * self.act_transfer_bytes
-        # KV cache 读取: [B, KV_H/TP, KV_S, head_dim]
-        read_kv = self.batch_size * self.num_kv_heads_per_tp * self.kv_seq_len * self.head_dim * self.cache_read_bytes
+        # KV cache 读取: K 和 V 都需要读取
+        # K: [B, KV_H/TP, KV_S, head_dim]
+        # V: [B, KV_H/TP, KV_S, head_dim]
+        read_kv = 2 * self.batch_size * self.num_kv_heads_per_tp * self.kv_seq_len * self.head_dim * self.cache_read_bytes
         # Output: [B, H/TP, S, head_dim]
         write_out = self.batch_size * self.num_heads_per_tp * self.seq_len * self.head_dim * self.act_transfer_bytes
 

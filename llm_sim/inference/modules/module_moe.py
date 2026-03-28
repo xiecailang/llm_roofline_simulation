@@ -140,17 +140,17 @@ class ModuleMoE(ModuleBase):
             shared_up = LayerExpertUp(
                 self.hardware_config, self.model_config,
                 self.deploy_config, self.quant_config,
-                self.seq_len, top_k=1
+                self.seq_len, top_k=1, is_shared=True
             )
             shared_gate = LayerExpertGateProj(
                 self.hardware_config, self.model_config,
                 self.deploy_config, self.quant_config,
-                self.seq_len, top_k=1
+                self.seq_len, top_k=1, is_shared=True
             )
             shared_down = LayerExpertDown(
                 self.hardware_config, self.model_config,
                 self.deploy_config, self.quant_config,
-                self.seq_len, top_k=1
+                self.seq_len, top_k=1, is_shared=True
             )
             shared_expert_time_ms = (
                 shared_up.get_cost_time() +
@@ -165,7 +165,7 @@ class ModuleMoE(ModuleBase):
                 LayerExpertUp(
                     self.hardware_config, self.model_config,
                     self.deploy_config, self.quant_config,
-                    self.seq_len, top_k=1
+                    self.seq_len, top_k=1, is_shared=True
                 )
             )
 
@@ -174,7 +174,7 @@ class ModuleMoE(ModuleBase):
                 LayerExpertGateProj(
                     self.hardware_config, self.model_config,
                     self.deploy_config, self.quant_config,
-                    self.seq_len, top_k=1
+                    self.seq_len, top_k=1, is_shared=True
                 )
             )
 
@@ -183,7 +183,7 @@ class ModuleMoE(ModuleBase):
                 LayerExpertDown(
                     self.hardware_config, self.model_config,
                     self.deploy_config, self.quant_config,
-                    self.seq_len, top_k=1
+                    self.seq_len, top_k=1, is_shared=True
                 )
             )
 

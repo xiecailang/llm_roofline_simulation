@@ -29,10 +29,11 @@ class LayerExpertGateUp(LayerBase):
     同时用于 Shared Expert 和 Routed Expert。
     """
 
-    def __init__(self, hardware_config, model_config, deploy_config, quant_config, seq_len, top_k=1):
+    def __init__(self, hardware_config, model_config, deploy_config, quant_config, seq_len, top_k=1, is_shared=False):
         super().__init__(hardware_config, model_config, deploy_config, quant_config)
         self.seq_len = seq_len
         self.top_k = top_k  # routed expert=top_k, shared expert=1
+        self.is_shared = is_shared  # Shared Expert 不使用 EP，完全复制
         self.moe_intermediate = getattr(model_config, 'moe_intermediate_size', model_config.intermediate_size)
         # MoE TP: intermediate按moe_tp切分
         self.intermediate_per_tp = self.moe_intermediate // self.moe_tp
@@ -72,7 +73,9 @@ class LayerExpertGateUp(LayerBase):
     def get_mem_bytes(self):
         """访存量
 
-        EP影响权重访存量（每个卡只存1/EP的专家权重）
+        EP 切分的是专家，不是权重：
+        - Routed Expert: 每个 EP rank 存储 num_experts_per_ep 个专家的完整权重
+        - Shared Expert: 完全复制到每个 rank，不使用 EP
         """
         # 实际处理的token-expert对数 = moe_batch_size * seq * top_k (EP不影响)
         token_expert_pairs = self.moe_batch_size * self.seq_len * self.top_k
@@ -80,8 +83,18 @@ class LayerExpertGateUp(LayerBase):
         # Input: [token_expert_pairs, hidden]
         read_input = token_expert_pairs * self.hidden_size * self.act_transfer_bytes
         # Weight: [hidden, intermediate/moe_tp * 2] per expert
-        # EP: 每个 EP rank 只存储 1/EP 的专家权重
-        read_weight = self.hidden_size * self.intermediate_per_tp * 2 * self.weight_bytes / self.ep
+        if self.is_shared:
+            # Shared Expert: 完全复制，不使用 EP
+            read_weight = (
+                self.hidden_size * self.intermediate_per_tp * 2 *
+                self.weight_bytes * self.num_shared_experts
+            )
+        else:
+            # Routed Expert: EP 切分专家
+            read_weight = (
+                self.hidden_size * self.intermediate_per_tp * 2 *
+                self.weight_bytes * self.num_experts_per_ep
+            )
         # Output: [token_expert_pairs, intermediate/moe_tp * 2]
         write_output = token_expert_pairs * self.intermediate_per_tp * 2 * self.act_transfer_bytes
 

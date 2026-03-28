@@ -34,6 +34,13 @@ class DeploymentConfig:
     # 参考: DeepSeek-V3使用auxiliary loss控制，典型值~1.1
     ep_load_imbalance_factor: float = 1.1
 
+    # EP冗余专家配置
+    # 每 EP rank 的冗余专家数，用于负载均衡
+    # 0 = 无冗余（默认）
+    # 典型值: 1-2（每个 rank 多存 1-2 个专家以平衡负载）
+    # 参考: DeepSeek-V3 使用 auxiliary loss 控制负载均衡
+    r_per_ep: int = 0
+
     # 计算-通信重叠配置
     # 启用DeepEP风格的计算-通信重叠
     enable_compute_comm_overlap: bool = True
