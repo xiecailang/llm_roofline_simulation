@@ -4,7 +4,12 @@ import argparse
 import json
 from pathlib import Path
 from llm_sim.configs import HardwareConfig, ModelConfig, QuantConfig, DeploymentConfig
-from llm_sim.inference.models import DecodeDeepSeekV32, PrefillDeepSeekV32
+from llm_sim.inference.models import (
+    DecodeDeepSeekV32, PrefillDeepSeekV32,
+    DecodeQwen2_5, PrefillQwen2_5,
+    DecodeMiniMaxM25, PrefillMiniMaxM25,
+    DecodeQwen35, PrefillQwen35,
+)
 
 
 def run_simulation(hardware_path, model_path, quant_path, deploy_path, output_dir="outputs"):
@@ -25,6 +30,14 @@ def run_simulation(hardware_path, model_path, quant_path, deploy_path, output_di
         print(f"        MoE: {model.num_experts}专家, top-{model.num_experts_per_tok}, shared={getattr(model, 'num_shared_experts', 0)}")
     if getattr(model, 'attention_type', '') == 'mla':
         print(f"        Attention: MLA (kv_lora_rank={getattr(model, 'kv_lora_rank', 512)})")
+    elif getattr(model, 'attention_type', '') == 'gqa':
+        print(f"        Attention: GQA (num_kv_heads={model.num_key_value_heads}, head_dim={getattr(model, 'head_dim', 128)})")
+    elif getattr(model, 'attention_type', '') == 'dsa':
+        print(f"        Attention: DSA (sparse)")
+    elif getattr(model, 'attention_type', '') == 'hybrid':
+        n_full = sum(1 for t in (model.layer_types or []) if t == "full_attention")
+        n_linear = model.num_hidden_layers - n_full
+        print(f"        Attention: Hybrid ({n_linear} Linear + {n_full} Full/60 layers)")
     print(f"  量化: weight={quant.default_weight_bits}bit, act={quant.default_activation_compute_bits}bit")
     print(f"  部署: mode={deploy.deployment_mode}, TP={deploy.attention_tp}, EP={deploy.expert_parallel}, PP={deploy.pipeline_parallel}")
     print(f"        MTP={deploy.mtp_length}, accept={deploy.mtp_acceptance_rate}")
@@ -40,12 +53,38 @@ def run_simulation(hardware_path, model_path, quant_path, deploy_path, output_di
     num_cards = hardware.total_chips // hardware.chips_per_card
     print(f"  Batch: micro={deploy.micro_batch_size}, total_bs={total_bs} (TP组={num_tp_groups}, 卡数={num_cards})")
 
-    # 根据 deployment_mode 选择模型
+    # 根据 deployment_mode 和 attention_type 选择模型
     print("\n[2/3] 运行性能仿真...")
+    attention_type = getattr(model, 'attention_type', 'mla')
+
     if deploy.deployment_mode == "decode":
-        inference_model = DecodeDeepSeekV32(hardware, model, deploy, quant)
+        if attention_type in ('mla', 'dsa'):
+            inference_model = DecodeDeepSeekV32(hardware, model, deploy, quant)
+        elif attention_type == 'gqa':
+            # GQA + MoE (MiniMax M2.5) vs GQA + Dense (Qwen 2.5)
+            if model.is_moe:
+                inference_model = DecodeMiniMaxM25(hardware, model, deploy, quant)
+            else:
+                inference_model = DecodeQwen2_5(hardware, model, deploy, quant)
+        elif attention_type == 'hybrid':
+            # Hybrid attention (Qwen3.5): Linear + Full Attention + MoE
+            inference_model = DecodeQwen35(hardware, model, deploy, quant)
+        else:
+            raise ValueError(f"不支持的 attention_type: {attention_type}")
     elif deploy.deployment_mode == "prefill":
-        inference_model = PrefillDeepSeekV32(hardware, model, deploy, quant)
+        if attention_type in ('mla', 'dsa'):
+            inference_model = PrefillDeepSeekV32(hardware, model, deploy, quant)
+        elif attention_type == 'gqa':
+            # GQA + MoE (MiniMax M2.5) vs GQA + Dense (Qwen 2.5)
+            if model.is_moe:
+                inference_model = PrefillMiniMaxM25(hardware, model, deploy, quant)
+            else:
+                inference_model = PrefillQwen2_5(hardware, model, deploy, quant)
+        elif attention_type == 'hybrid':
+            # Hybrid attention (Qwen3.5): Linear + Full Attention + MoE
+            inference_model = PrefillQwen35(hardware, model, deploy, quant)
+        else:
+            raise ValueError(f"不支持的 attention_type: {attention_type}")
     elif deploy.deployment_mode == "pd":
         # TODO: 实现 PD 混合模型
         raise NotImplementedError(f"PD 混合模型尚未实现")

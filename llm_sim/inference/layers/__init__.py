@@ -29,6 +29,10 @@ from .layer_indexer_wk_proj import LayerIndexerWKProj
 from .layer_indexer_k_norm import LayerIndexerKNorm
 from .layer_indexer_weights_proj import LayerIndexerWeightsProj
 from .layer_sparse_attn_indexer import LayerSparseAttnIndexer
+from .layer_gqa_attention import LayerGQAAttention
+from .layer_gqa_qkv_proj import LayerGQAQProj, LayerGQAKProj, LayerGQAVProj, LayerGQAOProj
+from .layer_linear_attention import LayerLinearAttention
+from .layer_linear_qkv_proj import LayerLinearQProj, LayerLinearKProj, LayerLinearVProj, LayerLinearOProj
 
 # 别名，保持向后兼容
 LayerMoEGateProj = LayerExpertGateProj
@@ -75,4 +79,16 @@ __all__ = [
     'LayerIndexerKNorm',
     'LayerIndexerWeightsProj',
     'LayerSparseAttnIndexer',
+    # GQA Attention
+    'LayerGQAAttention',
+    'LayerGQAQProj',
+    'LayerGQAKProj',
+    'LayerGQAVProj',
+    'LayerGQAOProj',
+    # Linear Attention (Gated DeltaNet)
+    'LayerLinearAttention',
+    'LayerLinearQProj',
+    'LayerLinearKProj',
+    'LayerLinearVProj',
+    'LayerLinearOProj',
 ]

@@ -1,0 +1,19 @@
+{
+  "deployment_mode": "prefill",
+  "mtp_length": 0,
+  "mtp_acceptance_rate": 1.0,
+  "context_parallel": 4,
+  "attention_tp": 1,
+  "pipeline_parallel": 1,
+  "pipeline_bubble_rate": 0.1,
+  "expert_parallel": 1,
+  "moe_tp": 1,
+  "lm_head_tp": 1,
+  "micro_batch_size": 1,
+  "input_length": 4096,
+  "output_length": 128,
+  "ep_load_imbalance_factor": 1.0,
+  "enable_compute_comm_overlap": true,
+  "overlap_efficiency": 0.9,
+  "prefix_cache_hit_rate": 0.0
+}

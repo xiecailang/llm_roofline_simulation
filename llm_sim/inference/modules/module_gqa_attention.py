@@ -1,43 +1,57 @@
-"""MLA Attention模块 - DeepSeek-V3的Multi-head Latent Attention
+"""GQA Attention 模块 - 用于 Qwen 2.5 等使用 Grouped Query Attention 的模型
 
-算子序列（按执行顺序）：
-1. [可选] allgather_input - AllGather (上游TP < attention_TP)
+GQA (Grouped Query Attention) 结构:
+1. [可选] AllGather Input (上游 TP < attention_TP)
 2. Input RMSNorm
-3. Q LoRA: q_a_proj + q_a_norm + q_b_proj
-4. KV LoRA: kv_a_proj + kv_a_norm + kv_b_proj
-5. MLA Attention
-6. O Projection (RowParallel)
-7. [可选] allreduce_output - AllReduce (attention_TP > 1)
-8. [可选] reduce_scatter_output - ReduceScatter (attention_TP > 下游TP)
+3. Q Projection (ColumnParallel)
+4. K Projection (ColumnParallel)
+5. V Projection (ColumnParallel)
+6. GQA Attention (Flash Attention)
+7. O Projection (RowParallel)
+8. [可选] AllReduce Output (attention_TP > 1)
+9. [可选] ReduceScatter Output (attention_TP > 下游 TP)
 
-TP影响：
-- q_a_proj: ColumnParallel, 输出按TP切分
-- q_b_proj: ColumnParallel, 输出按TP切分
-- kv_a_proj: ReplicatedLinear, 不切分
-- kv_b_proj: ColumnParallel, 输出按TP切分
-- mla_attention: 每个TP节点计算 num_heads/TP
-- o_proj: RowParallel, 输入按TP切分
+与 DSA/MLA 的差异:
+- 无 LoRA 压缩 (Q/K/V 直接投影)
+- 无 Lightning Indexer (非稀疏注意力)
+- KV cache 存储 num_kv_heads × head_dim (非压缩 latent)
+
+TP 影响:
+- Q/K/V projection: ColumnParallel, 输出按 TP 切分
+- O projection: RowParallel, 输入按 TP 切分
+- Attention: 每个 TP 节点计算 num_heads/TP 个 Q head
 """
 
 from .module_base import ModuleBase
 from .module_attention_comm import ModuleAttentionTPComm
 from ..layers import (
     LayerRMSNorm,
-    LayerMLAQAProj,
-    LayerMLAQBProj,
-    LayerMLAKVAProj,
-    LayerMLAKVBProj,
-    LayerMLAAttention,
-    LayerMatMul,
+    LayerGQAQProj,
+    LayerGQAKProj,
+    LayerGQAVProj,
+    LayerGQAOProj,
+    LayerGQAAttention,
 )
 
 
-class ModuleMLAAttention(ModuleBase):
-    """MLA Attention模块"""
+class ModuleGQAAttention(ModuleBase):
+    """GQA Attention 模块"""
 
     def __init__(self, hardware_config, model_config, deploy_config, quant_config,
                  seq_len, is_prefill=True, upstream_tp=None, downstream_tp=None,
                  kv_seq_len=None):
+        """初始化 GQA Attention 模块
+
+        Args:
+            seq_len: 查询序列长度 (本地 CP rank 的序列)
+            is_prefill: 是否为 Prefill 阶段
+            upstream_tp: 上游 TP 级别
+            downstream_tp: 下游 TP 级别
+            kv_seq_len: KV 序列长度覆盖 (用于 CP 场景)
+                       Prefill + CP: kv_seq_len = effective_seq_len (完整序列)
+                       Decode: kv_seq_len = input_length + 1 (缓存序列)
+                       None: 自动推导
+        """
         super().__init__(hardware_config, model_config, deploy_config, quant_config)
 
         self.seq_len = seq_len
@@ -47,12 +61,11 @@ class ModuleMLAAttention(ModuleBase):
         self.upstream_tp = upstream_tp or self.attention_tp
         self.downstream_tp = downstream_tp or self.attention_tp
         self.num_heads = model_config.num_attention_heads
-        self.v_head_dim = getattr(model_config, 'v_head_dim', 128)
+        self.head_dim = model_config.head_dim
         self.num_heads_per_tp = self.num_heads // self.attention_tp
 
-        # KV cache长度
+        # KV cache 长度
         if kv_seq_len is not None:
-            # 显式指定 (CP 场景)
             self.kv_seq_len = kv_seq_len
         elif is_prefill:
             self.kv_seq_len = seq_len
@@ -62,10 +75,10 @@ class ModuleMLAAttention(ModuleBase):
         self._build_layers()
 
     def _build_layers(self):
-        """构建MLA Attention的所有算子"""
+        """构建 GQA Attention 的所有算子"""
         batch_size = self.deploy_config.micro_batch_size
 
-        # ========== 1. [可选] AllGather Input (上游TP < attention_TP) ==========
+        # ========== 1. [可选] AllGather Input ==========
         if self.upstream_tp < self.attention_tp:
             comm_module = ModuleAttentionTPComm(
                 self.hardware_config, self.model_config,
@@ -87,90 +100,57 @@ class ModuleMLAAttention(ModuleBase):
             )
         )
 
-        # ========== 3-4. Q LoRA压缩 (ColumnParallel) ==========
+        # ========== 3. Q Projection (ColumnParallel) ==========
         self.add_layer(
-            'q_a_proj',
-            LayerMLAQAProj(
+            'q_proj',
+            LayerGQAQProj(
                 self.hardware_config, self.model_config,
                 self.deploy_config, self.quant_config,
                 self.seq_len
             )
         )
 
-        q_lora_rank = getattr(self.model_config, 'q_lora_rank', 1536)
-        q_lora_rank_per_tp = q_lora_rank // self.attention_tp
+        # ========== 4. K Projection (ColumnParallel) ==========
         self.add_layer(
-            'q_a_norm',
-            LayerRMSNorm(
-                self.hardware_config, self.model_config,
-                self.deploy_config, self.quant_config,
-                self.seq_len, q_lora_rank_per_tp
-            )
-        )
-
-        self.add_layer(
-            'q_b_proj',
-            LayerMLAQBProj(
+            'k_proj',
+            LayerGQAKProj(
                 self.hardware_config, self.model_config,
                 self.deploy_config, self.quant_config,
                 self.seq_len
             )
         )
 
-        # ========== 5-7. KV LoRA压缩 ==========
+        # ========== 5. V Projection (ColumnParallel) ==========
         self.add_layer(
-            'kv_a_proj',
-            LayerMLAKVAProj(
+            'v_proj',
+            LayerGQAVProj(
                 self.hardware_config, self.model_config,
                 self.deploy_config, self.quant_config,
                 self.seq_len
             )
         )
 
-        kv_lora_rank = getattr(self.model_config, 'kv_lora_rank', 512)
+        # ========== 6. GQA Attention (Flash Attention) ==========
         self.add_layer(
-            'kv_a_norm',
-            LayerRMSNorm(
-                self.hardware_config, self.model_config,
-                self.deploy_config, self.quant_config,
-                self.seq_len, kv_lora_rank
-            )
-        )
-
-        self.add_layer(
-            'kv_b_proj',
-            LayerMLAKVBProj(
-                self.hardware_config, self.model_config,
-                self.deploy_config, self.quant_config,
-                self.seq_len
-            )
-        )
-
-        # ========== 8. MLA Attention计算 ==========
-        self.add_layer(
-            'mla_attention',
-            LayerMLAAttention(
+            'attention',
+            LayerGQAAttention(
                 self.hardware_config, self.model_config,
                 self.deploy_config, self.quant_config,
                 self.seq_len, self.kv_seq_len, self.is_prefill
             )
         )
 
-        # ========== 9. O Projection (RowParallel) ==========
-        m = batch_size * self.seq_len
-        k = self.num_heads_per_tp * self.v_head_dim
-        n = self.hidden_size
+        # ========== 7. O Projection (RowParallel) ==========
         self.add_layer(
             'o_proj',
-            LayerMatMul(
+            LayerGQAOProj(
                 self.hardware_config, self.model_config,
                 self.deploy_config, self.quant_config,
-                m, k, n,
-                is_column_parallel=False  # RowParallel
+                self.seq_len
             )
         )
 
-        # ========== 10. [可选] AllReduce Output (attention_TP > 1) ==========
+        # ========== 8. [可选] AllReduce Output ==========
         if self.attention_tp > 1:
             comm_module = ModuleAttentionTPComm(
                 self.hardware_config, self.model_config,
@@ -182,7 +162,7 @@ class ModuleMLAAttention(ModuleBase):
                 if 'allreduce' in name:
                     self.add_layer('allreduce_output', layer)
 
-        # ========== 11. [可选] ReduceScatter Output (attention_TP > 下游TP) ==========
+        # ========== 9. [可选] ReduceScatter Output ==========
         if self.attention_tp > self.downstream_tp:
             comm_module = ModuleAttentionTPComm(
                 self.hardware_config, self.model_config,

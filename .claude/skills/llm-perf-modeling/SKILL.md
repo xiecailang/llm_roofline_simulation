@@ -1681,13 +1681,47 @@ p2p_latency = data_size / bandwidth + rtt_overhead
 
 FFN结构
 - **Dense**: Llama, Qwen, GPT (标准 Transformer)
-- **MoE**: DeepSeek-V3, Mixtral (专家混合)
+- **MoE**: DeepSeek-V3, Kimi K2.5, Mixtral (专家混合)
 
 注意力结构
-- **MLA**: DeepSeek-V3 (Multi-head Latent Attention)
-- **DSA**: DeepSeek-V3.2 (DeepSeek Sparse Attention)
-- **GQA**：minimax m2
+- **MLA**: DeepSeek-V3, **Kimi K2.5** (Multi-head Latent Attention)
+- **DSA**: DeepSeek-V3.2 (DeepSeek Sparse Attention = MLA + Lightning Indexer)
+- **GQA**: Qwen 2.5 (Dense), Llama 3 (Dense), MiniMax M2.5 (MoE) (Grouped Query Attention)
 - **Linear and Full Attention混合结构**: Qwen 3.5
+
+**关键**: GQA 模型可以是 Dense (Qwen 2.5, Llama 3) 或 MoE (MiniMax M2.5)。模型选择需要同时判断 `attention_type` 和 `model_type`。
+
+#### MLA 模型 vs DSA 模型的代码路径选择
+
+MLA 和 DSA 模型共享大部分架构（MLA KV 压缩、MoE、SwiGLU），但注意力层实现不同：
+
+```python
+# main.py 中的模型选择逻辑
+if attention_type in ('mla', 'dsa'):
+    # DecodeDeepSeekV32 / PrefillDeepSeekV32 内部根据 attention_type 选择：
+    if attention_type == 'dsa':
+        attn_module = ModuleDSAAttention(...)  # 含 Lightning Indexer
+    else:
+        attn_module = ModuleMLAAttention(...)  # 纯 MLA，无 Indexer
+elif attention_type == 'gqa':
+    if model.is_moe:
+        inference_model = DecodeMiniMaxM25(...)  # GQA + MoE (MiniMax M2.5)
+    else:
+        inference_model = DecodeQwen2_5(...)     # GQA + Dense (Qwen 2.5)
+```
+
+**关键差异**:
+
+| 特性 | MLA (DeepSeek V3, Kimi K2.5) | DSA (DeepSeek V3.2) |
+|------|-------------------------------|---------------------|
+| Attention 模块 | `ModuleMLAAttention` | `ModuleDSAAttention` |
+| Lightning Indexer | **无** | Decode 阶段启用 |
+| Decode 稀疏注意力 | **无** | index_topk 选择 |
+| KV 压缩 | kv_lora_rank | kv_lora_rank |
+| Q/K 投影 | LoRA (q_a→q_b, kv_a→kv_b) | LoRA (同 MLA) |
+
+**建模注意**: Kimi K2.5 使用纯 MLA (`attention_type: "mla"`)，不使用 DSA。如果错误地使用 `ModuleDSAAttention`，
+会因为缺少 `index_n_heads`/`index_head_dim` 参数（默认为 None）而报错。
 
 ## 参考资料
 
@@ -1839,3 +1873,754 @@ ffn_flops = 2 * B * H * seq * intermediate             # 正确
 
 **为什么**: Prefix Cache 命中的 token 不需要经过任何计算（attention、FFN、MoE），
 不仅仅是跳过 KV cache 读取。整个 Transformer 层的计算量都按 effective_seq_len 缩减。
+
+### GQA (Grouped Query Attention) 建模
+
+GQA 是一种与 MLA/DSA 完全不同的注意力机制，用于 Qwen 2.5、Llama 3 等模型。
+
+#### GQA vs MLA/DSA 关键差异
+
+| 特性 | MLA/DSA (DeepSeek) | GQA (Qwen 2.5, Llama 3) |
+|------|-------------------|------------------------|
+| KV 压缩 | LoRA 压缩 (kv_lora_rank=512) | **无压缩** |
+| KV cache 存储 | latent (kv_lora_rank 维度) | num_kv_heads × head_dim |
+| Q 投影 | LoRA (q_a → q_b) | 直接投影 hidden → num_heads × head_dim |
+| K/V 投影 | LoRA (kv_a → kv_b) | 直接投影 hidden → num_kv_heads × head_dim |
+| Lightning Indexer | DSA 特有 (Decode 稀疏) | **无** |
+| RoPE 处理 | qk_rope_head_dim 单独处理 | 标准 RoPE (应用在完整 head_dim) |
+| CP 通信大小 | batch × seq × kv_lora_rank | batch × seq × num_kv_heads × head_dim |
+
+#### GQA 结构
+
+```python
+# GQA 投影层
+Q_proj: hidden_size → num_heads × head_dim         # ColumnParallel
+K_proj: hidden_size → num_kv_heads × head_dim      # ColumnParallel
+V_proj: hidden_size → num_kv_heads × head_dim      # ColumnParallel
+O_proj: num_heads × head_dim → hidden_size         # RowParallel
+
+# GQA ratio
+group_size = num_heads / num_kv_heads  # 例如 Qwen 2.5 72B: 64/8 = 8
+```
+
+#### GQA Attention FLOPs 公式
+
+```python
+# Q @ K^T
+qk_flops = 2 × B × (num_heads/TP) × seq_len × head_dim × kv_seq_len
+
+# Score @ V
+sv_flops = 2 × B × (num_heads/TP) × seq_len × kv_seq_len × head_dim
+
+# Total
+attn_flops = qk_flops + sv_flops
+           = 4 × B × (num_heads/TP) × seq_len × kv_seq_len × head_dim
+```
+
+**与 MLA 的差异**: MLA 的 qk_head_dim = qk_nope + qk_rope，v_head_dim 可能不同。
+GQA 的 Q、K、V 维度相同（都是 head_dim）。
+
+#### GQA KV Cache 大小
+
+```python
+# MLA (压缩后)
+kv_cache_per_token = kv_lora_rank × dtype_bytes
+                   = 512 × 2 = 1024 bytes (FP16)
+
+# GQA (无压缩)
+kv_cache_per_token = 2 × num_kv_heads × head_dim × dtype_bytes
+                   = 2 × 8 × 128 × 2 = 4096 bytes (FP16, Qwen 2.5 72B)
+
+# GQA 的 KV cache 是 MLA 的 4 倍！
+```
+
+#### GQA 模块算子序列
+
+| 序号 | 算子名称 | 类型 | TP | 说明 |
+|------|----------|------|-----|------|
+| 1 | `allgather_input` | 通信 | ✓ | upstream_tp < attention_tp |
+| 2 | `input_norm` | Vector | - | RMSNorm |
+| 3 | `q_proj` | CUBE | ✓ | hidden → num_heads × head_dim |
+| 4 | `k_proj` | CUBE | ✓ | hidden → num_kv_heads × head_dim |
+| 5 | `v_proj` | CUBE | ✓ | hidden → num_kv_heads × head_dim |
+| 6 | `attention` | CUBE+Vector | ✓ | Q@K^T + softmax + S@V + RoPE |
+| 7 | `o_proj` | CUBE | ✓ | num_heads × head_dim → hidden |
+| 8 | `allreduce_output` | 通信 | ✓ | attention_tp > 1 |
+| 9 | `reduce_scatter_output` | 通信 | ✓ | attention_tp > downstream_tp |
+
+#### GQA CP 通信建模
+
+GQA 的 CP 通信使用完整的 KV（无压缩），通信量更大：
+
+```python
+# MLA CP 通信
+mla_kv_bytes = batch × seq_per_cp × kv_lora_rank × dtype_bytes
+
+# GQA CP 通信
+gqa_kv_bytes = batch × seq_per_cp × num_kv_heads × head_dim × dtype_bytes
+
+# GQA CP 通信量是 MLA 的 (num_kv_heads × head_dim / kv_lora_rank) 倍
+# 对于 Qwen 2.5 72B: 8 × 128 / 512 = 2 倍
+```
+
+#### Qwen 2.5 72B 模型配置
+
+```json
+{
+  "model_type": "gqa",
+  "hidden_size": 8192,
+  "num_hidden_layers": 80,
+  "num_attention_heads": 64,
+  "num_key_value_heads": 8,
+  "intermediate_size": 29568,
+  "vocab_size": 152064,
+  "head_dim": 128,
+  "rope_theta": 1000000.0,
+  "rms_norm_eps": 1e-06,
+  "attention_type": "gqa"
+}
+```
+
+**关键参数**:
+- GQA ratio = 64 / 8 = 8 (8 个 Q head 共享 1 个 KV head)
+- head_dim = 128 (Qwen 2.5 使用标准 head_dim，而非 MLA 的 qk_nope + qk_rope)
+- 无 MoE（Dense 模型）
+
+#### ❌ 错误24：GQA 模型的 CP 通信使用 kv_lora_rank
+
+```python
+# 错误：GQA 模型使用 MLA 的 CP 通信公式
+cp_comm = LayerCPComm(..., kv_lora_rank=512)  # GQA 没有这个参数！
+
+# 正确：GQA 模型使用 num_kv_heads × head_dim
+kv_cache_size = num_kv_heads * head_dim  # 8 × 128 = 1024
+cp_comm = LayerCPComm(..., kv_cache_size=kv_cache_size)
+```
+
+#### ❌ 错误25：GQA Attention 使用 MLA 的 head_dim 公式
+
+```python
+# 错误：使用 MLA 的 qk_head_dim
+qk_head_dim = qk_nope_head_dim + qk_rope_head_dim  # 128 + 64 = 192
+attn_flops = 2 * B * H * S * qk_head_dim * KV
+
+# 正确：GQA 使用标准的 head_dim
+attn_flops = 2 * B * H * S * head_dim * KV  # head_dim = 128
+```
+
+#### GQA 模型实现清单
+
+为 GQA 模型（如 Qwen 2.5）创建性能仿真时需要：
+
+| 文件 | 用途 |
+|------|------|
+| `layer_gqa_attention.py` | GQA attention 计算层 |
+| `layer_gqa_qkv_proj.py` | Q/K/V 投影层 |
+| `module_gqa_attention.py` | GQA attention 模块 |
+| `decode_qwen2_5.py` | Qwen 2.5 Decode 模型 |
+| `prefill_qwen2_5.py` | Qwen 2.5 Prefill 模型 |
+
+**关键实现要点**:
+1. Q/K/V 投影直接映射，无 LoRA 压缩
+2. 无 Lightning Indexer（非 DSA）
+3. KV cache 使用 num_kv_heads × head_dim
+4. CP 通信使用 GQA 的 KV cache 大小
+5. Dense FFN（无 MoE）
+
+### Kimi K2.5 模型建模
+
+#### 架构概述
+
+Kimi K2.5 是 Moonshot AI 发布的万亿参数 MoE 模型，使用与 DeepSeek V3 相同的 MLA 架构。
+
+**关键参数**:
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| Total Parameters | ~1T | 万亿参数 |
+| Active Parameters | 32B | 激活参数 |
+| hidden_size | 7168 | 隐藏层维度 |
+| num_hidden_layers | 61 | 层数 |
+| num_attention_heads | 64 | 注意力头数 |
+| num_experts | 384 | 路由专家数 |
+| num_experts_per_tok | 8 | 每个 token 激活的专家 |
+| num_shared_experts | 1 | 共享专家 |
+| moe_intermediate_size | 2048 | 每个 expert 的 intermediate |
+| kv_lora_rank | 512 | KV 压缩维度 |
+| q_lora_rank | 1536 | Q 压缩维度 |
+| qk_nope_head_dim | 128 | QK 非位置编码维度 |
+| qk_rope_head_dim | 64 | QK 位置编码维度 |
+| v_head_dim | 128 | V 维度 |
+| max_position_embeddings | 262144 (256K) | 最大上下文长度 |
+| vocab_size | 163840 | 词表大小 |
+| attention_type | "mla" | **纯 MLA，无 DSA** |
+
+#### Kimi K2.5 vs DeepSeek V3.2
+
+| 特性 | Kimi K2.5 | DeepSeek V3.2 |
+|------|----------|---------------|
+| attention_type | "mla" | "dsa" |
+| Lightning Indexer | **无** | **有** (Decode 阶段) |
+| num_experts | 384 | 256 |
+| max_seq | 256K | 128K |
+| MTP | 无 | 有 (投机解码) |
+| first_k_dense_replace | 1 | 3 |
+| routed_scaling_factor | 2.827 | 2.5 |
+
+#### Kimi K2.5 配置文件
+
+```json
+{
+  "model_type": "moe",
+  "hidden_size": 7168,
+  "num_hidden_layers": 61,
+  "num_attention_heads": 64,
+  "num_key_value_heads": 64,
+  "intermediate_size": 18432,
+  "vocab_size": 163840,
+  "max_position_embeddings": 262144,
+  "num_experts": 384,
+  "num_experts_per_tok": 8,
+  "num_shared_experts": 1,
+  "moe_intermediate_size": 2048,
+  "attention_type": "mla",
+  "qk_nope_head_dim": 128,
+  "qk_rope_head_dim": 64,
+  "v_head_dim": 128,
+  "kv_lora_rank": 512,
+  "q_lora_rank": 1536,
+  "rope_theta": 50000.0,
+  "rms_norm_eps": 1e-05,
+  "tie_word_embeddings": false,
+  "first_k_dense_replace": 1,
+  "moe_layer_freq": 1,
+  "n_group": 1,
+  "topk_group": 1,
+  "routed_scaling_factor": 2.827,
+  "scoring_func": "sigmoid",
+  "norm_topk_prob": true,
+  "num_nextn_predict_layers": 0
+}
+```
+
+#### 模型选择逻辑
+
+Kimi K2.5 使用 `attention_type: "mla"`，因此使用 `ModuleMLAAttention`（而非 `ModuleDSAAttention`）：
+
+```python
+# DecodeDeepSeekV32 内部的选择逻辑
+if self.attention_type == 'dsa':
+    attn_module = ModuleDSAAttention(...)  # DeepSeek V3.2
+else:
+    attn_module = ModuleMLAAttention(...)  # Kimi K2.5, DeepSeek V3
+```
+
+#### 关键差异
+
+1. **无 Lightning Indexer**: Kimi K2.5 使用纯 MLA，不需要 `index_n_heads` 和 `index_head_dim` 参数
+2. **更大专家数**: 384 专家 vs 256，需要更大的 EP 来保证每个芯片的专家数合理
+3. **更长上下文**: 256K vs 128K，Prefill 时内存需求更大
+4. **首层 Dense**: `first_k_dense_replace: 1`，仅第一层为 Dense FFN
+
+5. **无 MTP**: Kimi K2.5 不支持投机解码
+
+#### 性能建模要点
+
+1. **Decode 阶段**: 使用纯 MLA（无 DSA），attention 计算使用完整 KV cache
+2. **Prefill 阶段**: 使用 Full Attention，无稀疏选择
+3. **CP 通信**: MLA 压缩 KV cache，通信量 = batch × seq_per_cp × kv_lora_rank × dtype
+4. **MoE**: DeepEP high_throughput (Prefill) / low_latency (Decode)
+
+#### ❌ 错误26：Kimi K2.5 模型使用 DSA 模块
+
+```python
+# 错误：Kimi K2.5 使用 DSA 模块
+attn_module = ModuleDSAAttention(...)  # 报错：index_n_heads is None
+
+# 正确：根据 attention_type 选择模块
+if attention_type == 'dsa':
+    attn_module = ModuleDSAAttention(...)
+else:  # attention_type == 'mla'
+    attn_module = ModuleMLAAttention(...)
+```
+
+**为什么**: Kimi K2.5 的 `attention_type: "mla"`，不是 "dsa"。DSA 模块需要 `index_n_heads` 和 `index_head_dim` 参数来构建 Lightning Indexer，但纯 MLA 模型没有这些参数。
+
+#### ❌ 错误27：ModelConfig 的 Optional 字段默认值处理
+
+```python
+# 错误：getattr 的默认值无法覆盖 dataclass 的 None 默认值
+first_k = getattr(model_config, 'first_k_dense_replace', 0)  # 返回 None！
+
+# 正确：使用 or 0 处理 None 情况
+first_k = getattr(model_config, 'first_k_dense_replace', None) or 0
+```
+
+**为什么**: Python dataclass 的 Optional 字段默认值为 `None`，`getattr` 会返回实际值 `None` 而非第三个参数的默认值。
+
+#### 叚 nip > 1 时的 CP 通信
+
+对于 Kimi K2.5 的 256K 上下文，推荐使用 CP 来降低单卡显存压力：
+
+```python
+# CP=4, seq=4096, prefix_cache_hit=50%
+effective_seq = 4096 * 0.5 = 2048
+seq_per_cp = 2048 / 4 = 512
+```
+
+### MiniMax M2.5 模型建模
+
+#### 架构概述
+
+MiniMax M2.5 是 MiniMax 发布的 MoE 模型，使用 **GQA + MoE** 组合（与 Qwen 2.5 的 GQA + Dense 不同）。
+
+**关键参数**:
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| hidden_size | 3072 | 隐藏层维度 |
+| num_hidden_layers | 62 | 层数 |
+| num_attention_heads | 48 | Q head 数 |
+| num_key_value_heads | 8 | KV head 数 |
+| num_experts | 256 | 路由专家数 |
+| num_experts_per_tok | 8 | 每个 token 激活的专家 |
+| num_shared_experts | **0** | **无共享专家** |
+| head_dim | 128 | 标准头维度 |
+| intermediate_size | 1536 | FFN 中间维度 |
+| moe_intermediate_size | 1536 | MoE 中间维度 |
+| max_position_embeddings | 196608 (192K) | 最大上下文长度 |
+| vocab_size | 200064 | 词表大小 |
+| attention_type | "gqa" | GQA 注意力 |
+| MTP | 3 个验证模块 | 投机解码 |
+
+#### MiniMax M2.5 vs Qwen 2.5 vs DeepSeek V3.2
+
+| 特性 | MiniMax M2.5 | Qwen 2.5 72B | DeepSeek V3.2 |
+|------|-------------|---------------|---------------|
+| Attention | GQA | GQA | DSA (MLA+Indexer) |
+| FFN | **MoE** (256专家) | Dense | MoE (256专家) |
+| Shared Expert | **无** | N/A | 1 个 |
+| MTP | 3 模块 | 无 | 有 |
+| KV 压缩 | 无 | 无 | MLA (kv_lora_rank) |
+| hidden_size | 3072 | 8192 | 7168 |
+| num_layers | 62 | 80 | 61 |
+| max_seq | 192K | 128K | 128K |
+
+#### 模型选择逻辑
+
+MiniMax M2.5 的选择需要同时判断 `attention_type` 和 `model_type`（是否 MoE）：
+
+```python
+# main.py 中的模型选择逻辑
+if attention_type in ('mla', 'dsa'):
+    inference_model = DecodeDeepSeekV32(...)  # MLA/DSA + MoE
+elif attention_type == 'gqa':
+    if model.is_moe:
+        inference_model = DecodeMiniMaxM25(...)   # GQA + MoE (MiniMax M2.5)
+    else:
+        inference_model = DecodeQwen2_5(...)       # GQA + Dense (Qwen 2.5)
+```
+
+**为什么需要二级判断**: GQA 模型既可能是 Dense (Qwen 2.5) 也可能是 MoE (MiniMax M2.5)。
+FFN 模块的选择取决于 `model_type == "moe"`，而非 `attention_type`。
+
+#### 无 Shared Expert 的影响
+
+MiniMax M2.5 的 `num_shared_experts = 0`，这意味着：
+
+```python
+# MoE 模块中 shared expert 算子不会构建
+if self.n_shared > 0:
+    self.add_layer('share_up', ...)    # 不会执行
+    self.add_layer('share_gate_proj', ...)  # 不会执行
+    self.add_layer('share_down', ...)   # 不会执行
+
+# DeepEP overlap 的可重叠计算时间 = 0
+shared_expert_time_ms = 0.0  # 因为 n_shared = 0
+# → dispatch 通信无法与 shared expert 重叠
+# → effective_dispatch_time = max(dispatch_time, 0) = dispatch_time
+```
+
+**性能影响**: 无 Shared Expert 时，DeepEP 的 compute-communication overlap 失效，
+dispatch 通信时间无法被隐藏。这对 Decode 阶段的 TPOT 有一定影响。
+
+#### MTP 模块的 Attention 类型适配
+
+MiniMax M2.5 使用 GQA attention，MTP 验证层也需要使用 GQA（而非 MLA）：
+
+```python
+class ModuleMTPLayer(ModuleBase):
+    def __init__(self, ..., attention_type=None):
+        self.attention_type = attention_type or getattr(model_config, 'attention_type', 'mla')
+
+    def _build_layers(self):
+        # 根据 attention_type 选择对应的 Attention 模块
+        if self.attention_type in ('mla', 'dsa'):
+            from .module_mla_attention import ModuleMLAAttention
+            attn = ModuleMLAAttention(...)
+        elif self.attention_type == 'gqa':
+            from .module_gqa_attention import ModuleGQAAttention
+            attn = ModuleGQAAttention(...)
+```
+
+**设计原则**: MTP 模块应该根据主模型的 attention 类型自动选择对应的 Attention 实现，
+而不是硬编码为 MLA。
+
+#### ❌ 错误28：GQA + MoE 模型使用 Qwen 2.5 的 Dense 实现
+
+```python
+# 错误：GQA 模型统一使用 Dense FFN
+if attention_type == 'gqa':
+    inference_model = DecodeQwen2_5(...)  # Qwen 2.5 只有 Dense FFN！
+
+# 正确：区分 GQA + Dense 和 GQA + MoE
+if attention_type == 'gqa':
+    if model.is_moe:
+        inference_model = DecodeMiniMaxM25(...)  # MoE FFN
+    else:
+        inference_model = DecodeQwen2_5(...)      # Dense FFN
+```
+
+**为什么**: MiniMax M2.5 是 GQA + MoE 模型，使用 Dense FFN 的 Qwen 2.5 实现会完全忽略 MoE 层，
+导致 FLOPs 和通信建模严重失真。
+
+#### ❌ 错误29：MTP 模块硬编码 MLA Attention
+
+```python
+# 错误：MTP 模块硬编码使用 MLA
+from .module_mla_attention import ModuleMLAAttention
+attn = ModuleMLAAttention(...)  # GQA 模型会因缺少 q_lora_rank 报错！
+
+# 正确：根据 attention_type 动态选择
+attention_type = getattr(model_config, 'attention_type', 'mla')
+if attention_type in ('mla', 'dsa'):
+    attn = ModuleMLAAttention(...)
+elif attention_type == 'gqa':
+    attn = ModuleGQAAttention(...)
+```
+
+#### MiniMax M2.5 实现清单
+
+| 文件 | 用途 |
+|------|------|
+| `configs/models/minimax_m2_5.json` | 模型配置 |
+| `decode_minimax_m2_5.py` | Decode 模型 (GQA + MoE) |
+| `prefill_minimax_m2_5.py` | Prefill 模型 (GQA + MoE) |
+| `module_mtp_layer.py` | MTP 模块 (支持 GQA Attention) |
+
+**关键实现要点**:
+1. 复用 `ModuleGQAAttention`（与 Qwen 2.5 相同的 Attention 模块）
+2. 复用 `ModuleMoE`（与 DeepSeek V3.2 相同的 MoE 模块）
+3. 无 Shared Expert → DeepEP overlap 失效
+4. MTP 模块需要 GQA Attention 支持
+5. KV cache = 2 × num_kv_heads × head_dim × seq × layers（无 MLA 压缩）
+
+#### 性能特征
+
+MiniMax M2.5 的典型性能特征：
+
+| 阶段 | 瓶颈 | 说明 |
+|------|------|------|
+| Decode | **通信主导** (72.6%) | EP All-to-All + TP 通信占大头 |
+| Prefill | **计算主导** (80.8%) | CUBE 计算量大（长序列 × MoE） |
+| Decode CUBE | 仅 0.3% | seq_len=1 时计算量极小 |
+| Decode Memory | 15.1% | 权重访存仍有一定占比 |
+
+**Decode 通信占比高的原因**:
+- seq_len=1 时，每个 token 需要经过 8 个专家
+- EP=8 的 All-to-All dispatch/combine 通信是固定开销
+- 无 Shared Expert 无法与 dispatch 重叠
+- TP=2 的 AllReduce 通信也占一定比例
+
+### Qwen3.5 397B 混合注意力模型建模
+
+#### 架构概述
+
+Qwen3.5 397B 是阿里推出的混合注意力 MoE 模型，采用 **Gated DeltaNet (线性注意力) + GQA (全注意力) + MoE** 的创新架构。
+
+**关键参数**:
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| Total Parameters | ~397B | 3970亿参数 |
+| hidden_size | 4096 | 隐藏层维度 |
+| num_hidden_layers | 60 | 层数 |
+| num_attention_heads | 32 | Q head 数 (Full Attention) |
+| num_key_value_heads | 2 | KV head 数 (Full Attention) |
+| head_dim | 256 | Full Attention 头维度 |
+| **linear_num_key_heads** | 16 | Linear Attention K head 数 |
+| **linear_num_value_heads** | 64 | Linear Attention V head 数 |
+| **linear_key_head_dim** | 128 | Linear Attention K 维度 |
+| **linear_value_head_dim** | 128 | Linear Attention V 维度 |
+| linear_conv_kernel_dim | 4 | DeltaNet 卷积核维度 |
+| num_experts | 512 | 路由专家数 |
+| num_experts_per_tok | 10 | 每个 token 激活的专家 |
+| num_shared_experts | 1 | 共享专家 |
+| moe_intermediate_size | 1024 | MoE 中间维度 |
+| shared_expert_intermediate_size | 1024 | Shared Expert 中间维度 |
+| max_position_embeddings | 262144 (256K) | 最大上下文长度 |
+| vocab_size | 248320 | 词表大小 |
+| attention_type | "hybrid" | 混合注意力 |
+| full_attention_interval | 4 | 每4层一个 Full Attention |
+| MTP | 1 个验证模块 | 投机解码 |
+
+#### 混合注意力结构
+
+Qwen3.5 采用 3:1 的 Linear/Full Attention 混合比例：
+
+```
+Layer 0-2:   Linear Attention (Gated DeltaNet)
+Layer 3:     Full Attention (GQA)
+Layer 4-6:   Linear Attention
+Layer 7:     Full Attention
+...
+Layer 59:    Full Attention (最后一个)
+
+总计: 45 层 Linear Attention + 15 层 Full Attention
+```
+
+**层类型判断**:
+```python
+# 从 model_config.layer_types 获取，或根据 full_attention_interval 生成
+if model_config.layer_types:
+    layer_type = model_config.layer_types[layer_idx]
+else:
+    interval = model_config.full_attention_interval or 4
+    layer_type = "full_attention" if (layer_idx + 1) % interval == 0 else "linear_attention"
+```
+
+#### Gated DeltaNet 线性注意力原理
+
+Gated DeltaNet 是一种线性注意力机制，具有 **O(1) per-token 计算复杂度**：
+
+**核心特性**:
+1. **固定大小状态**: `S_t ∈ R^{d_k × d_v}` per head，不随序列长度增长
+2. **Delta rule 更新**: `S_t = β_t · S_{t-1} + (1 - β_t) · v_t ⊗ k_t^T`
+3. **无 growing KV cache**: 状态大小固定，与序列长度无关
+
+**Decode vs Prefill 计算复杂度**:
+
+| 阶段 | Full Attention (GQA) | Linear Attention (DeltaNet) |
+|------|---------------------|----------------------------|
+| Decode | O(T × d) per token | **O(d²) per token** (恒定) |
+| Prefill | O(T² × d) | O(T × d²) |
+
+其中 T = 序列长度，d = head 维度。
+
+**关键优势**: 当 T >> d 时 (长上下文)，Linear Attention 的 Decode 计算量远小于 Full Attention。
+
+#### Linear Attention FLOPs 公式
+
+**Decode 阶段** (seq_len=1):
+```python
+# State Update: v ⊗ k^T
+state_update_flops = 2 × num_key_heads × key_head_dim × value_head_dim
+
+# Query: q @ S
+query_flops = 2 × num_value_heads × value_head_dim × key_head_dim
+
+# Total per token
+linear_attn_flops = state_update_flops + query_flops
+                  = 2 × (num_key_heads + num_value_heads) × key_head_dim × value_head_dim
+```
+
+**Qwen3.5 Decode** (16 key heads, 64 value heads, 128 dim):
+```
+= 2 × (16 + 64) × 128 × 128
+= 2 × 80 × 16384
+= 2,621,440 FLOPs per token per layer
+```
+
+**对比 Full Attention Decode** (32 heads, 256 dim, T=8192):
+```
+= 4 × 32 × 1 × 8192 × 256
+= 268,435,456 FLOPs per token per layer
+```
+
+Linear Attention 比 Full Attention 快 **100倍** (8K context)!
+
+#### Prefill 阶段线性注意力
+
+Prefill 时需要遍历完整序列构建初始状态：
+
+```python
+# Per-token flops (同 Decode)
+per_token_flops = 2 × (num_key_heads + num_value_heads) × key_head_dim × value_head_dim
+
+# Total flops
+linear_attn_prefill_flops = seq_len × per_token_flops
+```
+
+**与 Full Attention Prefill 对比**:
+```
+Full Attention:  O(T² × d)  - 二次复杂度
+Linear Attention: O(T × d²) - 线性复杂度
+
+当 T > d²/d = d 时，Linear Attention 更优
+```
+
+#### Linear Attention 内存模型
+
+**固定状态大小** (不随序列增长):
+```python
+# Per-layer state size
+state_size = num_key_heads × key_head_dim × value_head_dim × dtype_bytes
+           = 16 × 128 × 128 × 2 = 524,288 bytes (FP16)
+```
+
+**与 GQA KV cache 对比**:
+```
+GQA KV cache (per layer, T=8192):
+  = 2 × batch × T × num_kv_heads × head_dim × dtype
+  = 2 × 1 × 8192 × 2 × 256 × 2
+  = 16,777,216 bytes (16MB)
+
+Linear Attention state (per layer):
+  = 16 × 128 × 128 × 2
+  = 524,288 bytes (0.5MB)
+
+节省 32 倍内存！
+```
+
+#### 模型选择逻辑
+
+Qwen3.5 使用 `attention_type: "hybrid"`，需要专门的处理分支：
+
+```python
+# main.py 中的模型选择逻辑
+if attention_type == 'hybrid':
+    # Hybrid attention (Qwen3.5): Linear + Full Attention + MoE
+    inference_model = DecodeQwen35(...)
+```
+
+**与其他模型的对比**:
+
+| attention_type | 模型 | Attention 类型 | FFN 类型 |
+|----------------|------|---------------|----------|
+| "mla" | Kimi K2.5 | 纯 MLA | MoE |
+| "dsa" | DeepSeek V3.2 | MLA + Indexer | MoE |
+| "gqa" + !is_moe | Qwen 2.5 | 纯 GQA | Dense |
+| "gqa" + is_moe | MiniMax M2.5 | 纯 GQA | MoE |
+| **"hybrid"** | **Qwen3.5** | **Linear + GQA** | **MoE** |
+
+#### 实现清单
+
+| 文件 | 用途 |
+|------|------|
+| `configs/models/qwen3_5_397b.json` | 模型配置 (含 layer_types) |
+| `layer_linear_attention.py` | Linear Attention 计算层 |
+| `layer_linear_qkv_proj.py` | Linear Attention Q/K/V/O 投影 |
+| `module_linear_attention.py` | Linear Attention 模块 |
+| `decode_qwen3_5.py` | Decode 模型 (混合注意力 + MoE) |
+| `prefill_qwen3_5.py` | Prefill 模型 (混合注意力 + MoE) |
+
+**关键实现要点**:
+1. Linear Attention 使用独立的投影维度 (linear_num_key_heads ≠ num_key_value_heads)
+2. Full Attention 层使用标准 GQA 模块
+3. Linear Attention 层使用 ModuleLinearAttention
+4. 仅 Full Attention 层需要 KV cache
+5. Linear Attention 层使用固定大小状态
+6. MTP 模块使用 GQA Attention (非 Linear)
+
+#### Linear vs Full Attention 模块差异
+
+| 特性 | ModuleLinearAttention | ModuleGQAAttention |
+|------|----------------------|-------------------|
+| Q 投影维度 | linear_num_value_heads × linear_value_head_dim | num_heads × head_dim |
+| K 投影维度 | linear_num_key_heads × linear_key_head_dim | num_kv_heads × head_dim |
+| V 投影维度 | linear_num_value_heads × linear_value_head_dim | num_kv_heads × head_dim |
+| Attention 计算 | LayerLinearAttention (O(d²)) | LayerGQAAttention (O(T×d)) |
+| KV cache | **固定状态** (无增长) | Growing (T × num_kv_heads × head_dim) |
+| CP 通信 | **不需要** (状态大小固定) | 需要 (Ring Attention) |
+
+#### 内存计算
+
+```python
+# Qwen3.5 内存占用 (Decode)
+w = weight_bits / 8
+cache_bytes = cache_bits / 8
+
+# 权重参数
+linear_attn_params = hidden × (linear_v_heads × linear_v_dim
+                               + linear_k_heads × linear_k_dim
+                               + linear_v_heads × linear_v_dim
+                               + linear_v_heads × linear_v_dim) + 2 × hidden
+full_attn_params = hidden × (num_heads + 2 × num_kv_heads) × head_dim + 2 × hidden
+moe_params = hidden × num_experts + num_experts × moe_inter × hidden × 3 + shared_inter × hidden × 3
+
+# 总参数
+total_params = vocab × hidden × 2  # Embedding + LM Head
+             + num_linear_layers × linear_attn_params
+             + num_full_layers × full_attn_params
+             + num_layers × moe_params
+
+# KV cache (仅 Full Attention 层)
+kv_cache = 2 × batch × max_seq × num_full_layers × num_kv_heads × head_dim × cache_bytes
+
+# Linear Attention 固定状态
+linear_state = num_linear_layers × linear_k_heads × linear_k_dim × linear_v_dim × cache_bytes
+
+memory_gb = (total_params × w + kv_cache + linear_state) / 1e9
+```
+
+#### 性能特征
+
+**Qwen3.5 Decode 性能** (Ascend 910C × 16, EP=8):
+- TPOT: ~8.3 ms/token
+- Memory: ~396 GB
+- 通信占比: ~39%
+- 计算占比: ~0.5%
+
+**Qwen3.5 Prefill 性能** (input=8K, prefix_cache=30%):
+- TTFT: ~515 ms
+- CUBE 占比: ~83%
+- 通信占比: ~36%
+
+**Linear Attention vs Full Attention Decode 时延对比**:
+```
+Full Attention 层 (15层): 每个 token 需要读取 8K × 2 × 256 = 4MB KV cache
+Linear Attention 层 (45层): 每个 token 只需读取 16 × 128 × 128 = 0.26MB 状态
+
+Linear Attention 比 Full Attention 节省 15 倍访存！
+```
+
+#### ❌ 错误30：Linear Attention 层误用 GQA 的投影维度
+
+```python
+# 错误：Linear Attention 使用 num_heads 和 head_dim
+q_proj = LayerGQAQProj(...)  # 输出 num_heads × head_dim
+k_proj = LayerGQAKProj(...)  # 输出 num_kv_heads × head_dim
+
+# 正确：Linear Attention 使用独立的维度
+q_proj = LayerLinearQProj(...)  # 输出 linear_num_value_heads × linear_value_head_dim
+k_proj = LayerLinearKProj(...)  # 输出 linear_num_key_heads × linear_key_head_dim
+```
+
+**为什么**: Linear Attention 的 K 和 V 有不同的 head 数量 (16 key heads, 64 value heads)，
+这与 GQA 的设计不同 (num_heads / num_kv_heads 比例)。
+
+#### ❌ 错误31：Linear Attention 层添加 CP 通信
+
+```python
+# 错误：Linear Attention 层添加 CP 通信
+if cp > 1:
+    self.add_layer('cp_comm', LayerCPComm(..., kv_cache_size=...))
+
+# 正确：Linear Attention 不需要 CP 通信
+# Linear Attention 的状态大小固定，与序列长度无关
+# CP 主要用于处理长序列的 KV cache 分布，Linear Attention 无此需求
+```
+
+**为什么**: Linear Attention 的状态大小固定 (`num_key_heads × key_head_dim × value_head_dim`)，
+不随序列长度增长。CP 的目的是将长序列的 KV cache 分布到多个设备，但 Linear Attention 的状态
+本身就可以完整存储在单个设备上，无需切分。
+
+#### ❌ 错误32：MTP 模块使用 Linear Attention
+
+```python
+# 错误：MTP 模块继承主模型的 Linear Attention
+mtp_module = ModuleMTPLayer(..., attention_type='linear')
+
+# 正确：Qwen3.5 MTP 使用 GQA (Full Attention)
+mtp_module = ModuleMTPLayer(..., attention_type='gqa')
+```
+
+**为什么**: Qwen3.5 的 MTP 投机解码模块使用 Full Attention (GQA)，而非 Linear Attention。
+这是架构设计的选择，MTP 需要对生成的 token 进行完整的 attention 计算。

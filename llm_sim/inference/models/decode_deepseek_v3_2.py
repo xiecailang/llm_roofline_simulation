@@ -22,7 +22,7 @@ PP (Pipeline Parallel) 支持:
 """
 
 from .inference_base import InferenceBase
-from ..modules import ModuleDSAAttention, ModuleMoE, ModuleDenseFFN, ModuleMTPLayer
+from ..modules import ModuleMLAAttention, ModuleDSAAttention, ModuleMoE, ModuleDenseFFN, ModuleMTPLayer
 from ..modules.module_base import ModuleBase
 from ..layers import LayerEmbedding, LayerMatMul, LayerRMSNorm, LayerAllGather, LayerP2P
 
@@ -47,8 +47,11 @@ class DecodeDeepSeekV32(InferenceBase):
         self.lm_head_tp = deploy_config.lm_head_tp
 
         # Dense FFN 层数配置
-        self.first_k_dense_replace = getattr(model_config, 'first_k_dense_replace', 0)
-        self.moe_layer_freq = getattr(model_config, 'moe_layer_freq', 1)
+        self.first_k_dense_replace = getattr(model_config, 'first_k_dense_replace', None) or 0
+        self.moe_layer_freq = getattr(model_config, 'moe_layer_freq', None) or 1
+
+        # Attention 类型: "mla" (Kimi K2.5, DeepSeek V3) 或 "dsa" (DeepSeek V3.2)
+        self.attention_type = getattr(model_config, 'attention_type', 'mla')
 
         # PP 配置
         self.pp = deploy_config.pipeline_parallel
@@ -131,14 +134,23 @@ class DecodeDeepSeekV32(InferenceBase):
             # 下游TP：MoE层用moe_tp，Dense层用attention_tp
             downstream_tp = moe_tp if is_moe else attention_tp
 
-            # DSA Attention (DeepSeek V3.2 使用 DSA 而不是 MLA)
-            attn_module = ModuleDSAAttention(
-                self.hardware_config, self.model_config,
-                self.deploy_config, self.quant_config,
-                self.seq_len, is_prefill=False,
-                upstream_tp=current_upstream_tp,
-                downstream_tp=downstream_tp
-            )
+            # Attention: MLA (Kimi K2.5, DeepSeek V3) 或 DSA (DeepSeek V3.2)
+            if self.attention_type == 'dsa':
+                attn_module = ModuleDSAAttention(
+                    self.hardware_config, self.model_config,
+                    self.deploy_config, self.quant_config,
+                    self.seq_len, is_prefill=False,
+                    upstream_tp=current_upstream_tp,
+                    downstream_tp=downstream_tp
+                )
+            else:
+                attn_module = ModuleMLAAttention(
+                    self.hardware_config, self.model_config,
+                    self.deploy_config, self.quant_config,
+                    self.seq_len, is_prefill=False,
+                    upstream_tp=current_upstream_tp,
+                    downstream_tp=downstream_tp
+                )
             self.add_module(f'layer_{layer_idx}_attention', attn_module)
 
             # FFN: Dense FFN 或 MoE

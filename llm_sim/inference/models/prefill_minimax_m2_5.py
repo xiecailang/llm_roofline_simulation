@@ -1,12 +1,15 @@
-"""DeepSeek-V3.2 Prefill模型 - PD分离部署的Prefill阶段
+"""MiniMax M2.5 Prefill 模型
 
-模型结构：
+模型结构:
 - Embedding
 - N * TransformerBlock:
-  - Layer 0 ~ (first_k_dense_replace-1): Dense FFN
-  - Layer first_k_dense_replace ~ N-1: MoE
+  - RMSNorm
+  - GQA Attention (48 Q heads, 8 KV heads, head_dim=128)
+  - RMSNorm
+  - MoE FFN (256 experts, 8 per token, NO shared expert)
+- RMSNorm
 - LM Head
-- No MTP (投机解码仅用于Decode阶段)
+- No MTP (投机解码仅用于 Decode 阶段)
 
 关键差异（vs Decode）:
 1. seq_len = input_length × (1 - prefix_cache_hit_rate) / CP
@@ -19,7 +22,7 @@ CP (Context Parallelism) 支持:
 - 序列按 token 切分到 CP ranks
 - 每个 CP rank 处理 effective_seq_len / CP tokens
 - Ring Attention 需要在每层 attention 后进行 CP 通信
-- CP 通信量 = batch × (seq/CP) × kv_lora_rank × dtype × (CP-1) rounds
+- CP 通信量 = batch × (seq/CP) × num_kv_heads × head_dim × dtype × (CP-1) rounds
 
 Prefix Cache 支持:
 - 缓存公共前缀的 KV cache (如 system prompt)
@@ -28,30 +31,29 @@ Prefix Cache 支持:
 """
 
 from .inference_base import InferenceBase
-from ..modules import ModuleMLAAttention, ModuleDSAAttention, ModuleMoE, ModuleDenseFFN, ModuleBase
+from ..modules import ModuleGQAAttention, ModuleMoE, ModuleBase
 from ..layers import (
     LayerEmbedding,
     LayerMatMul,
     LayerRMSNorm,
     LayerAllGather,
-    LayerAllReduce,
     LayerP2P,
     LayerCPComm,
 )
 
 
-class PrefillDeepSeekV32(InferenceBase):
-    """DeepSeek-V3.2 Prefill模型
+class PrefillMiniMaxM25(InferenceBase):
+    """MiniMax M2.5 Prefill 模型
 
-    Prefill阶段特点:
+    Prefill 阶段特点:
     - 完整序列处理 (seq_len >> 1)
-    - Full causal attention (非 sparse)
-    - 支持Context Parallelism (CP) 处理长序列
-    - 支持Prefix Cache命中优化
+    - Full causal attention
+    - 支持 Context Parallelism (CP) 处理长序列
+    - 支持 Prefix Cache 命中优化
     """
 
     def __init__(self, hardware_config, model_config, deploy_config, quant_config, pp_stage=0):
-        """初始化Prefill模型
+        """初始化 Prefill 模型
 
         Args:
             pp_stage: 当前建模的 PP stage（0-indexed），默认为 0
@@ -62,6 +64,10 @@ class PrefillDeepSeekV32(InferenceBase):
         self.hidden_size = model_config.hidden_size
         self.vocab_size = model_config.vocab_size
         self.lm_head_tp = deploy_config.lm_head_tp
+
+        # GQA 参数
+        self.num_kv_heads = model_config.num_key_value_heads
+        self.head_dim = model_config.head_dim
 
         # CP 配置
         self.cp = deploy_config.context_parallel
@@ -75,15 +81,10 @@ class PrefillDeepSeekV32(InferenceBase):
         self.effective_seq_len = int(deploy_config.input_length * (1 - self.prefix_cache_hit_rate))
         self.seq_len = self.effective_seq_len // self.cp if self.cp > 1 else self.effective_seq_len
 
-        # Dense FFN 层数配置
-        self.first_k_dense_replace = getattr(model_config, 'first_k_dense_replace', None) or 0
-        self.moe_layer_freq = getattr(model_config, 'moe_layer_freq', 1)
-
         # PP 配置
         self.pp = deploy_config.pipeline_parallel
         self.pp_stage = pp_stage
 
-        # 计算当前 stage 的层范围
         if self.pp > 1:
             self.layers_per_stage = self.num_layers // self.pp
             self.start_layer = self.pp_stage * self.layers_per_stage
@@ -94,27 +95,12 @@ class PrefillDeepSeekV32(InferenceBase):
             self.start_layer = 0
             self.end_layer = self.num_layers
 
-        # MLA KV lora rank (用于 CP 通信)
-        self.kv_lora_rank = getattr(model_config, 'kv_lora_rank', 512)
-
-        # Attention 类型: "mla" (Kimi K2.5, DeepSeek V3) 或 "dsa" (DeepSeek V3.2)
-        self.attention_type = getattr(model_config, 'attention_type', 'mla')
-
         self._build_modules()
 
-    def _is_moe_layer(self, layer_idx: int) -> bool:
-        """判断该层是否使用MoE"""
-        if self.model_config.num_experts is None:
-            return False
-        return (
-            layer_idx >= self.first_k_dense_replace
-            and layer_idx % self.moe_layer_freq == 0
-        )
-
     def _build_modules(self):
-        """构建Prefill模型的所有模块
+        """构建 Prefill 模型的所有模块
 
-        与Decode的关键差异:
+        与 Decode 的关键差异:
         1. seq_len = effective_seq_len / CP
         2. is_prefill=True (启用 full attention)
         3. kv_seq_len = effective_seq_len (CP 场景下完整序列)
@@ -146,36 +132,23 @@ class PrefillDeepSeekV32(InferenceBase):
         current_upstream_tp = attention_tp
 
         for layer_idx in range(self.start_layer, self.end_layer):
-            is_moe = self._is_moe_layer(layer_idx)
-            downstream_tp = moe_tp if is_moe else attention_tp
+            downstream_tp = moe_tp
 
-            # Attention: MLA (Kimi K2.5, DeepSeek V3) 或 DSA (DeepSeek V3.2)
-            # Prefill: full attention, 无 Lightning Indexer
+            # GQA Attention (Prefill: full attention)
             # 关键: kv_seq_len = effective_seq_len (CP 场景需要完整序列的 KV)
-            if self.attention_type == 'dsa':
-                attn_module = ModuleDSAAttention(
-                    self.hardware_config, self.model_config,
-                    self.deploy_config, self.quant_config,
-                    seq_len=self.seq_len,
-                    is_prefill=True,  # Full attention
-                    upstream_tp=current_upstream_tp,
-                    downstream_tp=downstream_tp,
-                    kv_seq_len=self.effective_seq_len  # CP: 完整序列 KV
-                )
-            else:
-                attn_module = ModuleMLAAttention(
-                    self.hardware_config, self.model_config,
-                    self.deploy_config, self.quant_config,
-                    seq_len=self.seq_len,
-                    is_prefill=True,  # Full attention
-                    upstream_tp=current_upstream_tp,
-                    downstream_tp=downstream_tp,
-                    kv_seq_len=self.effective_seq_len if self.cp > 1 else None  # CP: 完整序列 KV
-                )
+            attn_module = ModuleGQAAttention(
+                self.hardware_config, self.model_config,
+                self.deploy_config, self.quant_config,
+                seq_len=self.seq_len,
+                is_prefill=True,  # Full attention
+                upstream_tp=current_upstream_tp,
+                downstream_tp=downstream_tp,
+                kv_seq_len=self.effective_seq_len if self.cp > 1 else None  # CP: 完整序列 KV
+            )
             self.add_module(f'layer_{layer_idx}_attention', attn_module)
 
             # CP Communication (Ring Attention)
-            # 当 CP > 1 时，每层 attention 后需要 CP 通信
+            # GQA: KV cache 维度 = num_kv_heads × head_dim (无压缩)
             if self.cp > 1:
                 cp_comm_module = ModuleBase(
                     self.hardware_config, self.model_config,
@@ -189,30 +162,20 @@ class PrefillDeepSeekV32(InferenceBase):
                         batch_size=batch_size,
                         seq_per_cp=self.seq_len,
                         num_cp=self.cp,
-                        kv_lora_rank=self.kv_lora_rank
+                        kv_cache_size=self.num_kv_heads * self.head_dim  # GQA KV size
                     )
                 )
                 self.add_module(f'layer_{layer_idx}_cp_comm', cp_comm_module)
 
-            # FFN: Dense FFN 或 MoE
-            if is_moe:
-                # MoE层 (Prefill: high_throughput 模式)
-                ffn_module = ModuleMoE(
-                    self.hardware_config, self.model_config,
-                    self.deploy_config, self.quant_config,
-                    seq_len=self.seq_len,
-                    is_prefill=True,  # high_throughput mode
-                    enable_overlap=True
-                )
-                current_upstream_tp = attention_tp
-            else:
-                # Dense FFN层
-                ffn_module = ModuleDenseFFN(
-                    self.hardware_config, self.model_config,
-                    self.deploy_config, self.quant_config,
-                    self.seq_len
-                )
-                current_upstream_tp = attention_tp
+            # MoE FFN (Prefill: high_throughput 模式)
+            ffn_module = ModuleMoE(
+                self.hardware_config, self.model_config,
+                self.deploy_config, self.quant_config,
+                seq_len=self.seq_len,
+                is_prefill=True,  # high_throughput mode
+                enable_overlap=True
+            )
+            current_upstream_tp = attention_tp
             self.add_module(f'layer_{layer_idx}_ffn', ffn_module)
 
         # 3. PP 通信 (非最后一个 stage)
@@ -263,7 +226,7 @@ class PrefillDeepSeekV32(InferenceBase):
                 )
             )
 
-            # AllGather (TP通信)
+            # AllGather (TP 通信)
             if self.lm_head_tp > 1:
                 act_bytes = self.quant_config.default_activation_transfer_bits / 8
                 data_size = batch_size * self.seq_len * n * act_bytes
@@ -279,7 +242,7 @@ class PrefillDeepSeekV32(InferenceBase):
             self.add_module('lm_head', lm_head_module)
 
     def get_memory_usage(self):
-        """计算Prefill阶段内存占用 (GB)
+        """计算 Prefill 阶段内存占用 (GB)
 
         Prefill 阶段需要存储完整 KV cache (或根据 prefix cache 减少)
         """
@@ -290,20 +253,22 @@ class PrefillDeepSeekV32(InferenceBase):
         v = self.model_config.vocab_size
         n_layers = self.model_config.num_hidden_layers
         n_heads = self.model_config.num_attention_heads
-        q_lora = getattr(self.model_config, 'q_lora_rank', 1536)
-        kv_lora = getattr(self.model_config, 'kv_lora_rank', 512)
-        qk_nope = getattr(self.model_config, 'qk_nope_head_dim', 128)
-        qk_rope = getattr(self.model_config, 'qk_rope_head_dim', 64)
-        v_dim = getattr(self.model_config, 'v_head_dim', 128)
+        n_kv_heads = self.model_config.num_key_value_heads
+        head_dim = self.model_config.head_dim
 
-        # Dense FFN 参数
-        intermediate = self.model_config.intermediate_size
-        dense_ffn_params = 3 * h * intermediate
+        # 每层 Attention 参数 (GQA)
+        attn_params = (
+            h * n_heads * head_dim      # q_proj
+            + h * n_kv_heads * head_dim  # k_proj
+            + h * n_kv_heads * head_dim  # v_proj
+            + n_heads * head_dim * h     # o_proj
+            + 2 * h                      # norms
+        )
 
-        # MoE 参数
+        # MoE 参数 (无 shared expert)
         n_experts = self.model_config.num_experts or 1
         n_shared = getattr(self.model_config, 'num_shared_experts', 0) or 0
-        moe_inter = getattr(self.model_config, 'moe_intermediate_size', intermediate)
+        moe_inter = getattr(self.model_config, 'moe_intermediate_size', h)
         moe_params = (
             h * n_experts
             + n_experts * moe_inter * h * 3
@@ -314,28 +279,12 @@ class PrefillDeepSeekV32(InferenceBase):
         emb_params = v * h
         lm_head_params = v * h
 
-        # 每层 Attention 参数
-        attn_params = (
-            h * q_lora
-            + q_lora * (n_heads * (qk_nope + qk_rope))
-            + h * (kv_lora + qk_rope)
-            + kv_lora * (n_heads * (qk_nope + v_dim))
-            + n_heads * v_dim * h
-            + h + kv_lora + q_lora + h
-        )
-
         # 总参数
-        total_params = emb_params + lm_head_params
-        for layer_idx in range(n_layers):
-            total_params += attn_params
-            if self._is_moe_layer(layer_idx):
-                total_params += moe_params
-            else:
-                total_params += dense_ffn_params
+        total_params = emb_params + lm_head_params + n_layers * (attn_params + moe_params)
 
-        # KV cache (Prefill: 只存储 effective_seq_len 个 token)
-        # MLA 压缩: 2 * batch * effective_seq * layers * kv_lora_rank
+        # KV cache (GQA: num_kv_heads × head_dim per token)
+        # Prefill: 只存储 effective_seq_len 个 token
         batch = self.deploy_config.micro_batch_size
-        kv_cache = 2 * batch * self.effective_seq_len * n_layers * kv_lora * cache_bytes
+        kv_cache = 2 * batch * self.effective_seq_len * n_layers * n_kv_heads * head_dim * cache_bytes
 
         return (total_params * w + kv_cache) / 1e9

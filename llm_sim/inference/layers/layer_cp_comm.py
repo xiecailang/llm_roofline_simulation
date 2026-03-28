@@ -1,4 +1,4 @@
-"""CP通信算子 - Context Parallel Ring Attention 通信
+"""CP通信算子 - Context Parallelism Ring Attention 通信
 
 Context Parallelism (CP) 使用 Ring Attention 模式：
 - 序列按 token 切分到 CP ranks
@@ -14,7 +14,8 @@ Context Parallelism (CP) 使用 Ring Attention 模式：
 
 每轮通信量:
   - MLA 压缩后: batch × seq_per_cp × kv_lora_rank × dtype_bytes
-  - 未压缩: batch × seq_per_cp × num_heads × qk_head_dim × dtype_bytes
+  - GQA 未压缩: batch × seq_per_cp × num_kv_heads × head_dim × dtype_bytes
+  - 通用表示: batch × seq_per_cp × kv_cache_size × dtype_bytes
 
 时延公式:
   cp_comm_time = (CP-1) × per_round_latency
@@ -34,30 +35,44 @@ class LayerCPComm(LayerBase):
     Ring Attention 中，每个 CP rank 需要与 (CP-1) 个其他 rank 交换 KV cache。
     使用 Ring 模式，每轮与一个 neighbor 交换 KV block。
 
-    MLA 优化:
-    - KV cache 存储压缩后的 latent (kv_lora_rank 维度)
-    - 通信量 = batch × seq_per_cp × kv_lora_rank × dtype (而非完整 head 维度)
+    支持 MLA 和 GQA:
+    - MLA: KV cache 存储压缩后的 latent (kv_lora_rank 维度)
+    - GQA: KV cache 存储完整 KV (num_kv_heads × head_dim)
+    - 通过 kv_cache_size 参数统一处理
     """
 
     def __init__(self, hardware_config, model_config, deploy_config, quant_config,
-                 batch_size, seq_per_cp, num_cp, kv_lora_rank=512):
+                 batch_size, seq_per_cp, num_cp, kv_lora_rank=None, kv_cache_size=None):
         """初始化 CP 通信算子
 
         Args:
             batch_size: 批大小
             seq_per_cp: 每个 CP rank 处理的序列长度
             num_cp: Context Parallelism 的并行度
-            kv_lora_rank: MLA KV cache 压缩后的维度 (默认512)
+            kv_lora_rank: MLA KV cache 压缩后的维度 (兼容旧接口)
+            kv_cache_size: 通用 KV cache 每token维度 (GQA: num_kv_heads*head_dim)
         """
         super().__init__(hardware_config, model_config, deploy_config, quant_config)
         self.batch_size = batch_size
         self.seq_per_cp = seq_per_cp
         self.num_cp = num_cp
-        self.kv_lora_rank = kv_lora_rank
         self.is_comm_op = True
 
         # KV cache 使用 cache_write_bits 量化
         self.cache_bytes = quant_config.default_cache_write_bits / 8
+
+        # 优先使用 kv_cache_size，否则使用 kv_lora_rank (兼容 MLA)
+        if kv_cache_size is not None:
+            self.kv_dim = kv_cache_size
+        elif kv_lora_rank is not None:
+            self.kv_dim = kv_lora_rank
+        else:
+            # 自动推导: MLA 模型使用 kv_lora_rank，GQA 使用 num_kv_heads * head_dim
+            kv_lora = getattr(model_config, 'kv_lora_rank', None)
+            if kv_lora is not None:
+                self.kv_dim = kv_lora
+            else:
+                self.kv_dim = model_config.num_key_value_heads * model_config.head_dim
 
     def get_cube_flops(self):
         return 0.0
@@ -78,7 +93,7 @@ class LayerCPComm(LayerBase):
         总通信量 = 2 × (CP-1) × per_round_bytes
         """
         per_round_bytes = (
-            self.batch_size * self.seq_per_cp * self.kv_lora_rank * self.cache_bytes
+            self.batch_size * self.seq_per_cp * self.kv_dim * self.cache_bytes
         )
         return 2 * (self.num_cp - 1) * per_round_bytes
 
@@ -119,7 +134,7 @@ class LayerCPComm(LayerBase):
             return 0.0
 
         per_round_bytes = (
-            self.batch_size * self.seq_per_cp * self.kv_lora_rank * self.cache_bytes
+            self.batch_size * self.seq_per_cp * self.kv_dim * self.cache_bytes
         )
 
         bw_gbps, bw_util = self._get_bandwidth()
@@ -154,6 +169,6 @@ class LayerCPComm(LayerBase):
             # CP 扩展信息
             'cp_num_ranks': self.num_cp,
             'cp_seq_per_rank': self.seq_per_cp,
-            'cp_kv_lora_rank': self.kv_lora_rank,
+            'cp_kv_lora_rank': self.kv_dim,
             'cp_rounds': self.num_cp - 1,
         }

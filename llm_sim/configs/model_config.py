@@ -33,7 +33,8 @@ class ModelConfig:
     norm_topk_prob: Optional[bool] = None
 
     # Attention配置
-    attention_type: str = "mha"  # "mha", "gqa", "mla"
+    attention_type: str = "mha"  # "mha", "gqa", "mla", "dsa", "hybrid"
+    head_dim: Optional[int] = None  # GQA/MHA/Full Attention: 标准head_dim
     rope_theta: float = 10000.0
 
     # MLA专用配置
@@ -47,6 +48,16 @@ class ModelConfig:
     index_topk: Optional[int] = None  # 稀疏注意力选择的token数量
     index_n_heads: Optional[int] = None  # indexer的head数量
     index_head_dim: Optional[int] = None  # indexer的head维度
+
+    # 混合注意力配置 (Qwen3.5: Gated DeltaNet + Full Attention)
+    full_attention_interval: Optional[int] = None  # 每N层一个 full attention (如4表示每4层一个)
+    layer_types: Optional[list] = None  # 每层类型列表: ["linear_attention", "full_attention", ...]
+    linear_key_head_dim: Optional[int] = None  # DeltaNet K head维度
+    linear_num_key_heads: Optional[int] = None  # DeltaNet K head数量
+    linear_num_value_heads: Optional[int] = None  # DeltaNet V head数量
+    linear_value_head_dim: Optional[int] = None  # DeltaNet V head维度
+    linear_conv_kernel_dim: Optional[int] = None  # DeltaNet 卷积核维度
+    shared_expert_intermediate_size: Optional[int] = None  # 共享专家中间维度
 
     # 投机解码配置 (DeepSeek V3.2 Multi-Token Prediction)
     num_nextn_predict_layers: Optional[int] = None  # MTP head层数，0或None表示不使用

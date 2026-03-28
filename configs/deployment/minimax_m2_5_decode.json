@@ -1,0 +1,15 @@
+{
+  "deployment_mode": "decode",
+  "mtp_length": 3,
+  "mtp_acceptance_rate": 1.0,
+  "context_parallel": 1,
+  "attention_tp": 2,
+  "pipeline_parallel": 1,
+  "pipeline_bubble_rate": 0.1,
+  "expert_parallel": 8,
+  "moe_tp": 2,
+  "lm_head_tp": 2,
+  "micro_batch_size": 1,
+  "input_length": 8192,
+  "output_length": 1024
+}
