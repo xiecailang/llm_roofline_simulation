@@ -111,8 +111,8 @@ class LayerLinearAttention(LayerBase):
         - 固定大小状态 S: [num_key_heads, key_head_dim, value_head_dim] per batch
         - 只需读取当前 token 的 Q, K, V + 状态 S
 
-        Prefill: 无历史状态，需要从头构建
-        Decode: 读取固定大小状态 S，不需要读取历史 KV cache
+        Prefill: 从空状态开始构建，不需要读取历史状态
+        Decode: 读取固定大小状态 S，更新后写回
         """
         # Q: [B, num_value_heads/TP, S, value_head_dim]
         read_q = (self.batch_size * self.num_value_heads_per_tp
@@ -123,9 +123,16 @@ class LayerLinearAttention(LayerBase):
         # V: [B, num_value_heads/TP, S, value_head_dim]
         read_v = (self.batch_size * self.num_value_heads_per_tp
                   * self.seq_len * self.value_head_dim * self.act_transfer_bytes)
+
         # State S: [num_key_heads/TP, key_head_dim, value_head_dim] per batch
-        read_state = (self.batch_size * self.num_key_heads_per_tp
-                      * self.key_head_dim * self.value_head_dim * self.cache_read_bytes)
+        # Prefill: 从空状态开始，不需要读取
+        # Decode: 读取上一 token 的状态
+        if self.is_prefill:
+            read_state = 0
+        else:
+            read_state = (self.batch_size * self.num_key_heads_per_tp
+                          * self.key_head_dim * self.value_head_dim * self.cache_read_bytes)
+
         # Output: [B, num_value_heads/TP, S, value_head_dim]
         write_out = (self.batch_size * self.num_value_heads_per_tp
                      * self.seq_len * self.value_head_dim * self.act_transfer_bytes)
