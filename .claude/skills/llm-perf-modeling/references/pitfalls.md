@@ -323,3 +323,26 @@ read_kv = 2 * batch * num_kv_heads/TP * kv_seq_len * head_dim * cache_bytes
 ### 错误 35：将用户公式中的 `(nope*2+rope)` 误解为权重访存
 
 `(nope*2+rope)` 是 CUBE FLOPs 公式中的维度，不是访存公式。访存使用 `kv_lora_rank + qk_rope_head_dim`。
+
+---
+
+## 错误 36: Attention 访存量进阶
+
+### 错误 36：Linear Attention Prefill 错误读取状态
+
+```python
+# ❌ 错误：Prefill 也读取上一状态
+read_state = batch * num_key_heads * key_head_dim * value_head_dim * cache_bytes
+
+# ✅ 正确：Prefill 从空状态开始，不读取历史状态
+if self.is_prefill:
+    read_state = 0
+else:
+    read_state = batch * num_key_heads * key_head_dim * value_head_dim * cache_bytes
+```
+
+**原因**: Linear Attention Prefill 阶段从零状态开始，逐 token 构建状态矩阵，不需要读取已有的状态。
+
+### 错误 37：Flash Attention decode 误判为 compute-bound
+
+Decode (seq=1) 是 **memory-bound**，主要瓶颈是 KV cache 读取，不是 Q@K^T 计算。分析 decode 性能时应重点关注访存带宽利用率。

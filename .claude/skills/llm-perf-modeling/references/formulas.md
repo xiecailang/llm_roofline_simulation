@@ -165,7 +165,48 @@ read_state = B * (num_key_heads/TP) * key_head_dim * value_head_dim * cache_byte
 
 ---
 
-## 5. 通信公式
+## 5. Flash Attention 原理
+
+### IO 复杂度对比
+
+| 模式 | Standard Attention | Flash Attention |
+|------|---------------------|-----------------|
+| HBM 访问 | O(N²d) | O(N²d²/M) |
+| SRAM | O(1) | O(N²d²/M) |
+| 中间结果 | N×N attention 矩阵 | N×n 分块 attention |
+
+**M = SRAM block 大小** (H100: ~192 KB shared memory)
+
+**核心思想**: Tiling — 分块计算 attention，避免物化 N×N 中间矩阵到 HBM。
+
+### Decode vs Prefill 模式
+
+| 特性 | Decode (seq=1) | Prefill |
+|------|----------------|---------|
+| 瓶颈类型 | **Memory-bound** | Compute-bound |
+| 主要访存 | KV cache 读取 (O(N×d)) | Q/K/V 读取 (O(S×d)) |
+| 访存量/token | 2 × kv_seq_len × kv_dim | O(1)摊销 |
+| 计算量/token | O(kv_seq_len × d) | O(S × kv_seq_len × d) |
+
+**Decode 是 memory-bound 的原因**:
+- 每生成一个 token，需要读取完整 KV cache
+- bytes/token ≈ 2 × kv_seq_len × head_dim (K+V reads)
+- 计算量仅为 kv_seq_len × head_dim，远低于 HBM 带宽提供的算力
+
+### FlashMLA (DeepSeek MLA kernel)
+
+| 特性 | 说明 |
+|------|------|
+| 压缩 KV cache | `kv_lora_rank + qk_rope_head_dim` per token |
+| Decode 性能 | 410 TFlops (Hopper) |
+| Prefill 性能 | 640 TFlops (Hopper) |
+| 两种实现 | Prefill: compute-friendly; Decode: data-movement-friendly |
+
+**关键优化**: KV cache 存储压缩 latent，FlashMLA 内部完成解压投影。
+
+---
+
+## 6. 通信公式
 
 ### TP 通信
 
