@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 from llm_sim.configs import HardwareConfig, ModelConfig, QuantConfig, DeploymentConfig
-from llm_sim.inference.models import DecodeDeepSeekV32
+from llm_sim.inference.models import DecodeDeepSeekV32, PrefillDeepSeekV32
 
 
 def run_simulation(hardware_path, model_path, quant_path, deploy_path, output_dir="outputs"):
@@ -29,6 +29,9 @@ def run_simulation(hardware_path, model_path, quant_path, deploy_path, output_di
     print(f"  部署: mode={deploy.deployment_mode}, TP={deploy.attention_tp}, EP={deploy.expert_parallel}, PP={deploy.pipeline_parallel}")
     print(f"        MTP={deploy.mtp_length}, accept={deploy.mtp_acceptance_rate}")
     print(f"        CP={deploy.context_parallel}")
+    prefix_hit = getattr(deploy, 'prefix_cache_hit_rate', 0.0)
+    if prefix_hit > 0:
+        print(f"        PrefixCache={prefix_hit*100:.0f}%")
     print(f"  负载: input={deploy.input_length}, output={deploy.output_length}")
 
     # 计算TP组数量和全局batch size
@@ -42,8 +45,7 @@ def run_simulation(hardware_path, model_path, quant_path, deploy_path, output_di
     if deploy.deployment_mode == "decode":
         inference_model = DecodeDeepSeekV32(hardware, model, deploy, quant)
     elif deploy.deployment_mode == "prefill":
-        # TODO: 实现 Prefill 模型
-        raise NotImplementedError(f"Prefill 模型尚未实现")
+        inference_model = PrefillDeepSeekV32(hardware, model, deploy, quant)
     elif deploy.deployment_mode == "pd":
         # TODO: 实现 PD 混合模型
         raise NotImplementedError(f"PD 混合模型尚未实现")
@@ -93,7 +95,10 @@ def run_simulation(hardware_path, model_path, quant_path, deploy_path, output_di
         print(f"\n【单卡性能】({single_card['num_tp_groups'] // single_card['num_cards']} TP组/卡)")
         print(f"  QPS:        {single_card['qps_per_card']:.2f} req/s")
         print(f"  TPS:        {single_card['tps_per_card']:.2f} tokens/s")
-        print(f"  公式: Decode时 QPS = TPS / output_length = {single_card['tps_per_card']:.2f} / {single_card['output_length']} = {single_card['qps_per_card']:.2f}")
+        if single_card.get('ttft_ms') is not None and single_card.get('tpot_ms') is None:
+            print(f"  公式: Prefill时 QPS = total_bs / TTFT = {single_card['total_bs']} / {single_card['ttft_ms']:.3f}ms = {single_card['qps_per_card']:.2f}")
+        else:
+            print(f"  公式: Decode时 QPS = TPS / output_length = {single_card['tps_per_card']:.2f} / {single_card['output_length']} = {single_card['qps_per_card']:.2f}")
 
     # 显示系统级性能
     if system_perf:

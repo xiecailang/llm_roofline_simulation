@@ -56,7 +56,20 @@ class ModuleDSAAttention(ModuleBase):
     """DSA Attention模块"""
 
     def __init__(self, hardware_config, model_config, deploy_config, quant_config,
-                 seq_len, is_prefill=True, upstream_tp=None, downstream_tp=None):
+                 seq_len, is_prefill=True, upstream_tp=None, downstream_tp=None,
+                 kv_seq_len=None):
+        """初始化 DSA Attention 模块
+
+        Args:
+            seq_len: 查询序列长度 (本地 CP rank 的序列)
+            is_prefill: 是否为 Prefill 阶段
+            upstream_tp: 上游 TP 级别
+            downstream_tp: 下游 TP 级别
+            kv_seq_len: KV 序列长度覆盖 (用于 CP 场景)
+                       Prefill + CP: kv_seq_len = effective_seq_len (完整序列)
+                       Decode: kv_seq_len = input_length + 1 (缓存序列)
+                       None: 自动推导 (prefill=seq_len, decode=input_length+1)
+        """
         super().__init__(hardware_config, model_config, deploy_config, quant_config)
 
         self.seq_len = seq_len
@@ -70,7 +83,10 @@ class ModuleDSAAttention(ModuleBase):
         self.num_heads_per_tp = self.num_heads // self.attention_tp
 
         # KV cache长度
-        if is_prefill:
+        if kv_seq_len is not None:
+            # 显式指定 (CP 场景)
+            self.kv_seq_len = kv_seq_len
+        elif is_prefill:
             self.kv_seq_len = seq_len
         else:
             self.kv_seq_len = deploy_config.input_length + 1

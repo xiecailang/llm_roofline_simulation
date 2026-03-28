@@ -971,6 +971,62 @@ EP 负载不均衡主要影响:
 | 1.2 | 0.271 ms | +18.9% |
 | 1.5 | 0.336 ms | +47.4% |
 
+# ❌ 错误21：MLA/DSA Attention CUBE FLOPs 计算混淆
+# MLA 的 Q 和 K 有两个部分：nope (无位置编码) 和 rope (有RoPE)
+# Q@K^T 实际是两个独立的 matmul: Q_nope @ K_nope^T + Q_rope @ K_rope^T
+
+# 错误示例：将 Q@K^T 当作单个 matmul 计算
+# 用户可能误用的简化公式：
+cube_flops = H/TP * (qk_nope*2 + qk_rope) * B * S * index_topk * 2
+
+# 这个公式看起来有 "qk_nope*2"，让人困惑
+# 实际上这是因为 v_head_dim = qk_nope_head_dim (DeepSeek-V3特有)
+
+# ✅ 正确：显式计算 Q@K 和 S@V
+def get_cube_flops(self):
+    # Q @ K^T: [B, H/TP, S, qk_head_dim] @ [B, H/TP, qk_head_dim, KV]
+    # 其中 qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+    qk_flops = 2 * B * H/TP * S * qk_head_dim * effective_kv_len
+
+    # Score @ V: [B, H/TP, S, KV] @ [B, H/TP, KV, v_head_dim]
+    sv_flops = 2 * B * H/TP * S * effective_kv_len * v_head_dim
+
+    return qk_flops + sv_flops
+```
+
+**MLA Attention CUBE FLOPs 公式推导**:
+
+| 操作 | 维度 | FLOPs |
+|------|------|-------|
+| Q_nope @ K_nope^T | [B,H/TP,S,qk_nope] @ [B,H/TP,qk_nope,KV] | 2×B×H/TP×S×qk_nope×KV |
+| Q_rope @ K_rope^T | [B,H/TP,S,qk_rope] @ [B,H/TP,qk_rope,KV] | 2×B×H/TP×S×qk_rope×KV |
+| Score @ V | [B,H/TP,S,KV] @ [B,H/TP,KV,v_head_dim] | 2×B×H/TP×S×KV×v_head_dim |
+
+**总 CUBE FLOPs**:
+```
+= 2 × B × H/TP × S × KV × (qk_nope + qk_rope + v_head_dim)
+= 2 × B × H/TP × S × KV × (qk_head_dim + v_head_dim)
+```
+
+**DeepSeek-V3 特例** (v_head_dim = qk_nope_head_dim = 128):
+```
+= 2 × B × H/TP × S × KV × (128 + 64 + 128)
+= 2 × B × H/TP × S × KV × 320
+```
+
+这与用户简化公式等价:
+```
+H/TP × (qk_nope*2 + qk_rope) × B × S × KV × 2
+= 2 × H/TP × (256 + 64) × B × S × KV
+= 2 × B × H/TP × S × KV × 320  ✓
+```
+
+**关键理解**:
+1. 用户的简化公式 `qk_nope*2` 实际上是 `qk_nope + v_head_dim`
+2. 这个简化在 DeepSeek-V3 上成立（两者都是 128）
+3. 但对于其他模型，应该使用通用公式 `qk_head_dim + v_head_dim`
+4. 当前实现使用通用公式，是正确的
+
 ### DeepEP 通信优化技术
 
 **DeepEP** 是 DeepSeek 开源的高性能 MoE 通信库，专门针对 Expert Parallelism (EP) 的 All-to-All 通信进行优化。
@@ -1669,3 +1725,117 @@ FFN结构
 - ✅ Attention 实现使用 `topk_tokens` 而非 `sparse_ratio`
 - ✅ Decode 阶段的计算量 = seq_len × topk_tokens
 - ✅ 参考 vllm 的 `SparseAttnIndexer` 实现
+
+### Prefill 阶段性能建模
+
+#### Prefill vs Decode 关键差异
+
+| 特性 | Decode | Prefill |
+|------|--------|---------|
+| seq_len | 1 | input_length × (1-cache_hit) / CP |
+| kv_seq_len | input_length + 1 | input_length × (1-cache_hit) |
+| Attention | DSA Sparse (index_topk) | Full Attention (无稀疏) |
+| Lightning Indexer | 启用 | 禁用 |
+| DeepEP Mode | low_latency (Pure RDMA) | high_throughput |
+| CP Communication | 无 | (CP-1) 轮 Ring KV 交换 |
+| MTP | 有 (投机解码) | 无 |
+| 性能指标 | TPOT (ms/token) | TTFT (ms/request) |
+
+#### Context Parallelism (CP) 建模
+
+CP 将长序列按 token 切分到多个 CP rank：
+
+```python
+effective_seq_len = input_length * (1 - prefix_cache_hit_rate)
+seq_per_cp = effective_seq_len / CP
+```
+
+**Ring Attention 通信建模**:
+```
+CP 通信量 (每轮) = batch × seq_per_cp × kv_lora_rank × dtype
+CP 通信轮数 = CP - 1
+CP 通信时延 = (CP-1) × per_round_latency
+per_round_latency = kv_bytes / bandwidth + rtt_overhead + static_overhead
+```
+
+**MLA 压缩优化**: CP 通信使用 MLA 压缩后的 KV latent (kv_lora_rank=512)，而非完整的 head 维度。
+
+**CP 对 Attention FLOPs 的影响**:
+- Q 维度 = seq_per_cp (每个 CP rank 的本地序列)
+- K 维度 = effective_seq_len (完整序列，通过 Ring 通信获取)
+- Q@K FLOPs = 2 × B × H/TP × seq_per_cp × effective_seq_len × qk_head_dim
+
+#### Prefix Cache Hit Rate 建模
+
+Prefix Cache 缓存公共前缀的 KV cache，避免重复计算：
+
+```python
+# 命中的 prefix token 不需要重新计算
+effective_seq_len = input_length * (1 - prefix_cache_hit_rate)
+
+# 影响范围:
+# 1. Attention: seq_len 和 kv_seq_len 都减少
+# 2. FFN/MoE: 只处理 effective_seq_len 个 token
+# 3. KV cache: 只写入 effective_seq_len 个新 token
+# 4. 不影响: 权重访存、通信模式
+```
+
+**典型场景**:
+| 场景 | prefix_cache_hit_rate | 说明 |
+|------|----------------------|------|
+| 冷启动 | 0.0 | 无缓存，完整 prefill |
+| 系统提示 | 0.3-0.5 | system prompt 已缓存 |
+| Few-shot | 0.5-0.7 | system + examples 已缓存 |
+| 多轮对话 | 0.7-0.9 | 历史对话已缓存 |
+
+#### Prefill Forward 流程
+
+```
+Per CP Rank (seq_per_cp tokens):
+
+For each Transformer Layer:
+  1. Input RMSNorm
+  2. Q LoRA: q_a_proj → q_a_norm → q_b_proj
+  3. KV LoRA: kv_a_proj → kv_a_norm → kv_b_proj
+  4. DSA Attention (is_prefill=True, Full Attention)
+     - kv_seq_len = effective_seq_len (完整序列)
+  5. [CP > 1] Ring Attention CP Communication
+  6. O Projection (RowParallel)
+  7. [TP comm] AllReduce / ReduceScatter
+  8. Post Attention RMSNorm
+  9. FFN / MoE (DeepEP high_throughput 模式)
+```
+
+#### ❌ 错误22：Prefill CP 场景下 kv_seq_len 使用 seq_per_cp
+
+```python
+# 错误：kv_seq_len = seq_per_cp (只考虑本地序列)
+attn_module = ModuleDSAAttention(..., seq_len=seq_per_cp, is_prefill=True)
+# 此时内部 kv_seq_len = seq_len = seq_per_cp
+# 但实际 Ring Attention 需要访问完整序列的 KV!
+
+# 正确：显式指定 kv_seq_len = effective_seq_len
+attn_module = ModuleDSAAttention(
+    ..., seq_len=seq_per_cp,  # Q 维度 (本地)
+    is_prefill=True,
+    kv_seq_len=effective_seq_len  # KV 维度 (完整序列)
+)
+```
+
+**为什么**: Ring Attention 中，每个 CP rank 的 Q 只有本地 token，但 K 来自所有 CP rank。
+总 Q@K FLOPs = seq_per_cp × effective_seq_len，而非 seq_per_cp × seq_per_cp。
+
+#### ❌ 错误23：Prefix Cache Hit Rate 仅减少 KV cache 读取
+
+```python
+# 错误：只减少 KV cache 读取，但仍然计算全部 token 的 FFN
+attn_flops = 2 * B * H * effective_seq * kv_seq_len  # 正确
+ffn_flops = 2 * B * H * input_length * intermediate    # 错误！应该用 effective_seq
+
+# 正确：Prefix Cache 减少所有计算，不仅仅是 KV cache
+seq = input_length * (1 - prefix_cache_hit_rate)
+ffn_flops = 2 * B * H * seq * intermediate             # 正确
+```
+
+**为什么**: Prefix Cache 命中的 token 不需要经过任何计算（attention、FFN、MoE），
+不仅仅是跳过 KV cache 读取。整个 Transformer 层的计算量都按 effective_seq_len 缩减。

@@ -23,6 +23,7 @@ from .layer_allgather import LayerAllGather
 from .layer_reduce_scatter import LayerReduceScatter
 from .layer_all2all import LayerAll2All
 from .layer_p2p import LayerP2P, LayerP2PSend, LayerP2PRecv
+from .layer_cp_comm import LayerCPComm  # Context Parallel communication
 from .layer_indexer_wq_proj import LayerIndexerWQProj
 from .layer_indexer_wk_proj import LayerIndexerWKProj
 from .layer_indexer_k_norm import LayerIndexerKNorm
@@ -67,6 +68,7 @@ __all__ = [
     'LayerP2P',
     'LayerP2PSend',
     'LayerP2PRecv',
+    'LayerCPComm',
     # Indexer
     'LayerIndexerWQProj',
     'LayerIndexerWKProj',

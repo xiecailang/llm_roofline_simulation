@@ -45,6 +45,14 @@ class DeploymentConfig:
     input_length: int = 1024
     output_length: int = 128
 
+    # Prefix Cache 配置
+    # 命中率 (0.0 - 1.0)
+    # 0.0: 无缓存命中，完整 prefill
+    # 1.0: 完全缓存命中，仅计算新增 token
+    # 典型值: 0.3-0.7 (系统提示 + few-shot 示例已被缓存)
+    # 命中的 prefix token 不需要重新计算 attention 和 FFN
+    prefix_cache_hit_rate: float = 0.0
+
     # 注意：稀疏注意力 (DSA) 的 topk_tokens 参数应在 model_config 中配置
     # 而不是 deployment_config。DSA 使用 index_topk (绝对值)，而非 ratio (比例)
 

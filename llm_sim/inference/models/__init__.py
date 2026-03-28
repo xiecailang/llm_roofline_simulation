@@ -2,8 +2,10 @@
 
 from .inference_base import InferenceBase
 from .decode_deepseek_v3_2 import DecodeDeepSeekV32
+from .prefill_deepseek_v3_2 import PrefillDeepSeekV32
 
 __all__ = [
     'InferenceBase',
     'DecodeDeepSeekV32',
+    'PrefillDeepSeekV32',
 ]
